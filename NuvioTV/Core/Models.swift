@@ -1,0 +1,595 @@
+import Foundation
+
+// MARK: - Stremio addon manifest
+
+struct AddonManifest: Codable, Identifiable, Hashable {
+    let id: String
+    let name: String
+    let version: String?
+    let description: String?
+    let logo: String?
+    let types: [String]?
+    let idPrefixes: [String]?
+    let catalogs: [ManifestCatalog]?
+    let resources: [ManifestResource]?
+
+    private func provides(_ resource: String) -> Bool {
+        resources?.contains { $0.name == resource } ?? false
+    }
+
+    var providesStreams: Bool { provides("stream") }
+    var providesMeta: Bool { provides("meta") }
+    var providesCatalogs: Bool { !(catalogs ?? []).isEmpty }
+    var providesSubtitles: Bool { provides("subtitles") }
+}
+
+/// Manifest `resources` entries are either plain strings ("stream") or
+/// objects ({"name": "stream", "types": [...], "idPrefixes": [...]}).
+enum ManifestResource: Codable, Hashable {
+    case simple(String)
+    case detailed(name: String, types: [String]?, idPrefixes: [String]?)
+
+    var name: String {
+        switch self {
+        case .simple(let name): return name
+        case .detailed(let name, _, _): return name
+        }
+    }
+
+    private struct Detailed: Codable {
+        let name: String
+        let types: [String]?
+        let idPrefixes: [String]?
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.singleValueContainer()
+        if let string = try? container.decode(String.self) {
+            self = .simple(string)
+        } else {
+            let obj = try container.decode(Detailed.self)
+            self = .detailed(name: obj.name, types: obj.types, idPrefixes: obj.idPrefixes)
+        }
+    }
+
+    func encode(to encoder: Encoder) throws {
+        var container = encoder.singleValueContainer()
+        switch self {
+        case .simple(let name):
+            try container.encode(name)
+        case .detailed(let name, let types, let idPrefixes):
+            try container.encode(Detailed(name: name, types: types, idPrefixes: idPrefixes))
+        }
+    }
+}
+
+struct ManifestCatalog: Codable, Identifiable, Hashable {
+    let type: String
+    let id: String
+    let name: String?
+    let extra: [CatalogExtra]?
+    let extraRequired: [String]?
+    let extraSupported: [String]?
+
+    /// Catalogs that require an extra argument (search, genre...) cannot be
+    /// shown as plain home rows.
+    var requiresExtra: Bool {
+        if let extraRequired, !extraRequired.isEmpty { return true }
+        return extra?.contains { $0.isRequired == true } ?? false
+    }
+
+    var supportsSearch: Bool {
+        if extraSupported?.contains("search") == true { return true }
+        return extra?.contains { $0.name == "search" } ?? false
+    }
+
+    /// Genres this catalog can filter by (from the `genre` extra's options).
+    var genreOptions: [String] {
+        extra?.first { $0.name == "genre" }?.options ?? []
+    }
+
+    var displayName: String {
+        let base = name ?? id.capitalized
+        let typeLabel: String
+        switch type {
+        case "movie": typeLabel = "Movies"
+        case "series": typeLabel = "Series"
+        case "tv": typeLabel = "TV"
+        default: typeLabel = type.capitalized
+        }
+        if base.lowercased().contains(typeLabel.lowercased()) { return base }
+        return "\(base) \(typeLabel)"
+    }
+}
+
+struct CatalogExtra: Codable, Hashable {
+    let name: String?
+    let isRequired: Bool?
+    /// Allowed values for this extra (e.g. the genre list when `name == "genre"`).
+    let options: [String]?
+
+    private enum CodingKeys: String, CodingKey {
+        case name
+        case isRequired
+        case options
+    }
+}
+
+struct InstalledAddon: Codable, Identifiable, Hashable {
+    let manifestURL: String
+    let manifest: AddonManifest
+    /// Disabled addons stay installed but contribute no catalogs/streams — the
+    /// APK's per-addon on/off toggle.
+    var enabled: Bool = true
+
+    var id: String { manifestURL }
+
+    private enum CodingKeys: String, CodingKey { case manifestURL, manifest, enabled }
+
+    init(manifestURL: String, manifest: AddonManifest, enabled: Bool = true) {
+        self.manifestURL = manifestURL
+        self.manifest = manifest
+        self.enabled = enabled
+    }
+
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        manifestURL = try c.decode(String.self, forKey: .manifestURL)
+        manifest = try c.decode(AddonManifest.self, forKey: .manifest)
+        // Back-compat: addons saved before the toggle existed default to on.
+        enabled = try c.decodeIfPresent(Bool.self, forKey: .enabled) ?? true
+    }
+
+    var baseURL: String {
+        var base = manifestURL
+        if base.hasSuffix("/manifest.json") {
+            base = String(base.dropLast("/manifest.json".count))
+        }
+        return base
+    }
+
+    /// Whether this addon claims to resolve the given content id.
+    func handles(id contentID: String) -> Bool {
+        guard let prefixes = manifest.idPrefixes, !prefixes.isEmpty else { return true }
+        return prefixes.contains { contentID.hasPrefix($0) }
+    }
+}
+
+// MARK: - Meta
+
+struct MetaItem: Codable, Identifiable, Hashable {
+    let id: String
+    let type: String
+    let name: String
+    let poster: String?
+    let background: String?
+    let logo: String?
+    let description: String?
+    let releaseInfo: String?
+    let imdbRating: String?
+    let runtime: String?
+    let genres: [String]?
+    let cast: [String]?
+    let videos: [MetaVideo]?
+
+    private enum CodingKeys: String, CodingKey {
+        case id, type, name, poster, background, logo, description
+        case releaseInfo, imdbRating, runtime, genres, cast, videos, year
+    }
+
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        id = try c.decode(String.self, forKey: .id)
+        type = (try? c.decode(String.self, forKey: .type)) ?? "movie"
+        name = (try? c.decode(String.self, forKey: .name)) ?? ""
+        poster = try? c.decode(String.self, forKey: .poster)
+        background = try? c.decode(String.self, forKey: .background)
+        logo = try? c.decode(String.self, forKey: .logo)
+        description = try? c.decode(String.self, forKey: .description)
+        if let info = try? c.decode(String.self, forKey: .releaseInfo) {
+            releaseInfo = info
+        } else if let year = try? c.decode(Int.self, forKey: .year) {
+            releaseInfo = String(year)
+        } else if let year = try? c.decode(String.self, forKey: .year) {
+            releaseInfo = year
+        } else {
+            releaseInfo = nil
+        }
+        if let rating = try? c.decode(String.self, forKey: .imdbRating) {
+            imdbRating = rating
+        } else if let rating = try? c.decode(Double.self, forKey: .imdbRating) {
+            imdbRating = String(format: "%.1f", rating)
+        } else {
+            imdbRating = nil
+        }
+        runtime = try? c.decode(String.self, forKey: .runtime)
+        genres = try? c.decode([String].self, forKey: .genres)
+        cast = try? c.decode([String].self, forKey: .cast)
+        videos = try? c.decode([MetaVideo].self, forKey: .videos)
+    }
+
+    func encode(to encoder: Encoder) throws {
+        var c = encoder.container(keyedBy: CodingKeys.self)
+        try c.encode(id, forKey: .id)
+        try c.encode(type, forKey: .type)
+        try c.encode(name, forKey: .name)
+        try c.encodeIfPresent(poster, forKey: .poster)
+        try c.encodeIfPresent(background, forKey: .background)
+        try c.encodeIfPresent(logo, forKey: .logo)
+        try c.encodeIfPresent(description, forKey: .description)
+        try c.encodeIfPresent(releaseInfo, forKey: .releaseInfo)
+        try c.encodeIfPresent(imdbRating, forKey: .imdbRating)
+        try c.encodeIfPresent(runtime, forKey: .runtime)
+        try c.encodeIfPresent(genres, forKey: .genres)
+        try c.encodeIfPresent(cast, forKey: .cast)
+        try c.encodeIfPresent(videos, forKey: .videos)
+    }
+
+    init(
+        id: String, type: String, name: String,
+        poster: String? = nil, background: String? = nil, logo: String? = nil,
+        description: String? = nil, releaseInfo: String? = nil, imdbRating: String? = nil,
+        runtime: String? = nil, genres: [String]? = nil, cast: [String]? = nil,
+        videos: [MetaVideo]? = nil
+    ) {
+        self.id = id
+        self.type = type
+        self.name = name
+        self.poster = poster
+        self.background = background
+        self.logo = logo
+        self.description = description
+        self.releaseInfo = releaseInfo
+        self.imdbRating = imdbRating
+        self.runtime = runtime
+        self.genres = genres
+        self.cast = cast
+        self.videos = videos
+    }
+
+    var year: String? {
+        guard let releaseInfo, !releaseInfo.isEmpty else { return nil }
+        return String(releaseInfo.prefix(4))
+    }
+
+    var isSeries: Bool { type == "series" || type == "tv" }
+
+    /// Capitalized content type for meta lines ("Movie" / "Series"), matching the APK.
+    var typeLabel: String {
+        switch type {
+        case "series", "tv": return "Series"
+        case "movie": return "Movie"
+        default: return type.capitalized
+        }
+    }
+
+    /// Runtime in the APK's "1h 49m" format (Cinemeta sends "109 min").
+    var runtimeFormatted: String? {
+        guard let runtime else { return nil }
+        let trimmed = runtime.trimmingCharacters(in: .whitespaces)
+        if trimmed.contains("h") { return trimmed }   // already "1h 49m"-ish
+        let digits = trimmed.prefix { $0.isNumber }
+        guard let total = Int(digits), total > 0 else { return trimmed }
+        if total >= 60 {
+            let h = total / 60, m = total % 60
+            return m > 0 ? "\(h)h \(m)m" : "\(h)h"
+        }
+        return "\(total)m"
+    }
+
+    var seasons: [Int] {
+        let numbers = Set((videos ?? []).compactMap { $0.season }.filter { $0 > 0 })
+        return numbers.sorted()
+    }
+
+    func episodes(season: Int) -> [MetaVideo] {
+        (videos ?? [])
+            .filter { $0.season == season }
+            .sorted { ($0.episode ?? 0) < ($1.episode ?? 0) }
+    }
+}
+
+struct MetaVideo: Codable, Identifiable, Hashable {
+    let id: String
+    let title: String?
+    let season: Int?
+    let episode: Int?
+    let thumbnail: String?
+    let overview: String?
+    let released: String?
+
+    private enum CodingKeys: String, CodingKey {
+        case id, title, name, season, episode, number, thumbnail, overview, released
+    }
+
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        id = try c.decode(String.self, forKey: .id)
+        title = (try? c.decode(String.self, forKey: .title))
+            ?? (try? c.decode(String.self, forKey: .name))
+        season = try? c.decode(Int.self, forKey: .season)
+        episode = (try? c.decode(Int.self, forKey: .episode))
+            ?? (try? c.decode(Int.self, forKey: .number))
+        thumbnail = try? c.decode(String.self, forKey: .thumbnail)
+        overview = try? c.decode(String.self, forKey: .overview)
+        released = try? c.decode(String.self, forKey: .released)
+    }
+
+    func encode(to encoder: Encoder) throws {
+        var c = encoder.container(keyedBy: CodingKeys.self)
+        try c.encode(id, forKey: .id)
+        try c.encodeIfPresent(title, forKey: .title)
+        try c.encodeIfPresent(season, forKey: .season)
+        try c.encodeIfPresent(episode, forKey: .episode)
+        try c.encodeIfPresent(thumbnail, forKey: .thumbnail)
+        try c.encodeIfPresent(overview, forKey: .overview)
+        try c.encodeIfPresent(released, forKey: .released)
+    }
+
+    init(
+        id: String, title: String?, season: Int?, episode: Int?,
+        thumbnail: String? = nil, overview: String? = nil, released: String? = nil
+    ) {
+        self.id = id
+        self.title = title
+        self.season = season
+        self.episode = episode
+        self.thumbnail = thumbnail
+        self.overview = overview
+        self.released = released
+    }
+
+    var hasAired: Bool {
+        guard let released else { return true }
+        let formatter = ISO8601DateFormatter()
+        formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        if let date = formatter.date(from: released) { return date <= Date() }
+        formatter.formatOptions = [.withInternetDateTime]
+        if let date = formatter.date(from: released) { return date <= Date() }
+        return true
+    }
+
+    var seasonEpisodeCode: String {
+        guard let season, let episode else { return "" }
+        return "S\(season):E\(episode)"
+    }
+
+    /// Air date formatted for display ("Jun 25, 2021"), or nil if unknown.
+    var airedText: String? {
+        guard let released, !released.isEmpty else { return nil }
+        let iso = ISO8601DateFormatter()
+        iso.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        var date = iso.date(from: released)
+        if date == nil { iso.formatOptions = [.withInternetDateTime]; date = iso.date(from: released) }
+        if date == nil {
+            // Bare "yyyy-MM-dd".
+            let ymd = DateFormatter()
+            ymd.dateFormat = "yyyy-MM-dd"
+            date = ymd.date(from: String(released.prefix(10)))
+        }
+        guard let date else { return nil }
+        let out = DateFormatter()
+        out.dateStyle = .medium
+        return out.string(from: date)
+    }
+}
+
+// MARK: - Streams
+
+struct Stream: Codable, Hashable {
+    let name: String?
+    let title: String?
+    let description: String?
+    let url: String?
+    let infoHash: String?
+    let fileIdx: Int?
+    /// Tracker/DHT sources for building a magnet URI (Stremio torrent streams).
+    let sources: [String]?
+    let behaviorHints: StreamBehaviorHints?
+
+    private enum CodingKeys: String, CodingKey {
+        case name, title, description, url, infoHash, fileIdx, sources, behaviorHints
+    }
+
+    init(
+        name: String?, title: String?, description: String?, url: String?,
+        infoHash: String?, fileIdx: Int? = nil, sources: [String]? = nil,
+        behaviorHints: StreamBehaviorHints?
+    ) {
+        self.name = name
+        self.title = title
+        self.description = description
+        self.url = url
+        self.infoHash = infoHash
+        self.fileIdx = fileIdx
+        self.sources = sources
+        self.behaviorHints = behaviorHints
+    }
+
+    var isPlayable: Bool {
+        guard let url, let parsed = URL(string: url) else { return false }
+        return parsed.scheme == "http" || parsed.scheme == "https"
+    }
+
+    var isTorrent: Bool { infoHash != nil && url == nil }
+
+    /// Debrid-cached marker, e.g. "[RD+]", "[TB+]", "PM+" — the convention
+    /// Torrentio/Comet/MediaFusion use for torrents the provider already has
+    /// (instant play, no download wait).
+    private static let cachedMarkerRegex = try? NSRegularExpression(
+        pattern: #"\b(rd|ad|pm|tb|dl|oc|pk|ed)\+"#, options: [.caseInsensitive]
+    )
+
+    /// True when picking this source plays immediately: a direct http(s)
+    /// link, or a torrent the debrid service reports as already cached
+    /// (the "[RD+]"-style marker, a ⚡, or the word "cached"). An unmarked
+    /// torrent counts as NOT instant — the debrid provider would have to
+    /// download it first.
+    var isInstant: Bool {
+        if isPlayable { return true }
+        let haystack = "\(name ?? "") \(title ?? "") \(description ?? "")"
+        if haystack.contains("⚡") { return true }
+        let lower = haystack.lowercased()
+        if lower.contains("uncached") { return false }
+        if lower.contains("cached") { return true }
+        guard let regex = Self.cachedMarkerRegex else { return false }
+        return regex.firstMatch(
+            in: haystack, options: [],
+            range: NSRange(haystack.startIndex..., in: haystack)
+        ) != nil
+    }
+
+    /// A magnet URI built from the info hash and any tracker sources.
+    var magnetURI: String? {
+        guard let infoHash, !infoHash.isEmpty else { return nil }
+        var magnet = "magnet:?xt=urn:btih:\(infoHash)"
+        for source in sources ?? [] {
+            let trimmed = source.trimmingCharacters(in: .whitespaces)
+            guard !trimmed.isEmpty, !trimmed.lowercased().hasPrefix("dht:") else { continue }
+            let tracker = trimmed.hasPrefix("tracker:") ? String(trimmed.dropFirst("tracker:".count)) : trimmed
+            if let encoded = tracker.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed) {
+                magnet += "&tr=\(encoded)"
+            }
+        }
+        return magnet
+    }
+
+    /// Addon-provided short label, e.g. "Torrentio\n4K".
+    var displayName: String {
+        (name ?? "Stream").replacingOccurrences(of: "\n", with: " · ")
+    }
+
+    /// Longer description lines with file / size details.
+    var displayDetail: String {
+        let raw = title ?? description ?? ""
+        return raw.replacingOccurrences(of: "\n", with: " · ")
+    }
+
+    var qualityTag: String? {
+        let haystack = "\(name ?? "") \(title ?? "") \(description ?? "")".lowercased()
+        for tag in ["2160p", "4k", "1080p", "720p", "480p"] where haystack.contains(tag) {
+            return tag == "4k" ? "4K" : tag
+        }
+        return nil
+    }
+
+    /// Resolution normalized to the "2160p / 1080p / 720p" form.
+    var resolutionLabel: String? {
+        guard let tag = qualityTag else { return nil }
+        return tag == "4K" ? "2160p" : tag
+    }
+
+    /// Compiled once — `String.range(of:.regularExpression)` recompiles the
+    /// pattern on every call, which was a real per-row cost on long source
+    /// lists.
+    private static let sizeRegex = try? NSRegularExpression(
+        pattern: #"(\d+(?:\.\d+)?)\s*(GB|GiB|MB|MiB)"#, options: [.caseInsensitive]
+    )
+
+    /// File size, e.g. "55.3 GB". Prefers the addon's exact byte count
+    /// (behaviorHints.videoSize — Torrentio and friends set it), otherwise
+    /// parses the "💾 55.3 GB"-style text most stream addons embed.
+    /// NOTE: string/regex work — read it via StreamEntry's precomputed copy in
+    /// row bodies, never directly per render.
+    var fileSizeLabel: String? {
+        if let bytes = behaviorHints?.videoSize, bytes > 0 {
+            let gb = Double(bytes) / 1_073_741_824
+            if gb >= 1 {
+                return String(format: gb >= 100 ? "%.0f GB" : "%.1f GB", gb)
+            }
+            let mb = Double(bytes) / 1_048_576
+            return String(format: "%.0f MB", mb)
+        }
+        let haystack = "\(name ?? "") \(title ?? "") \(description ?? "")"
+        guard let regex = Self.sizeRegex,
+              let match = regex.firstMatch(
+                in: haystack, options: [],
+                range: NSRange(haystack.startIndex..., in: haystack)
+              ),
+              let range = Range(match.range, in: haystack) else { return nil }
+        let matched = haystack[range]
+        let unit = matched.lowercased().contains("m") ? "MB" : "GB"
+        let number = matched.trimmingCharacters(in: CharacterSet(charactersIn: " GgBbIiMm"))
+        return "\(number) \(unit)"
+    }
+
+    /// Numeric file size in bytes for sorting/ranking sources (the high-GB vs
+    /// low-GB split). Prefers the exact `behaviorHints.videoSize`, else parses
+    /// the embedded "💾 55.3 GB" text. nil when no size is discoverable — such
+    /// sources sort as smallest so they fill data-saver slots, not top ones.
+    var sizeBytes: Int64? {
+        if let bytes = behaviorHints?.videoSize, bytes > 0 { return bytes }
+        let haystack = "\(name ?? "") \(title ?? "") \(description ?? "")"
+        guard let regex = Self.sizeRegex,
+              let match = regex.firstMatch(
+                in: haystack, options: [],
+                range: NSRange(haystack.startIndex..., in: haystack)
+              ),
+              let numberRange = Range(match.range(at: 1), in: haystack),
+              let unitRange = Range(match.range(at: 2), in: haystack),
+              let value = Double(haystack[numberRange]) else { return nil }
+        let multiplier: Double = haystack[unitRange].lowercased().hasPrefix("m")
+            ? 1_048_576 : 1_073_741_824
+        return Int64(value * multiplier)
+    }
+}
+
+struct StreamBehaviorHints: Codable, Hashable {
+    let bingeGroup: String?
+    let notWebReady: Bool?
+    /// Exact video size in bytes (Stremio SDK field, set by Torrentio etc.).
+    let videoSize: Int64?
+    let filename: String?
+}
+
+/// A stream tagged with the addon it came from, used across the stream
+/// selection UI and in-player source switching.
+struct StreamEntry: Identifiable, Hashable {
+    let id = UUID()
+    let addonName: String
+    let stream: Stream
+    /// Display strings PRECOMPUTED here, once per entry: computing them in
+    /// row bodies (regex + string builds, × every visible row × every focus
+    /// move) was the main Sources-page scroll cost.
+    let displayName: String
+    let displayDetail: String
+    let resolutionLabel: String?
+    let fileSizeLabel: String?
+    /// Numeric size for ranking (high-GB vs low-GB tier split); nil = unknown.
+    let sizeBytes: Int64?
+    /// Plays immediately (direct link / debrid-cached torrent) — precomputed,
+    /// it's regex work.
+    let isInstant: Bool
+
+    init(addonName: String, stream: Stream) {
+        self.addonName = addonName
+        self.stream = stream
+        displayName = stream.displayName
+        displayDetail = stream.displayDetail
+        resolutionLabel = stream.resolutionLabel
+        fileSizeLabel = stream.fileSizeLabel
+        sizeBytes = stream.sizeBytes
+        isInstant = stream.isInstant
+    }
+
+    static func == (lhs: StreamEntry, rhs: StreamEntry) -> Bool { lhs.id == rhs.id }
+    func hash(into hasher: inout Hasher) { hasher.combine(id) }
+}
+
+// MARK: - API response envelopes
+
+struct CatalogResponse: Codable {
+    let metas: [MetaItem]?
+}
+
+struct MetaResponse: Codable {
+    let meta: MetaItem?
+}
+
+struct StreamsResponse: Codable {
+    let streams: [Stream]?
+}
+
+struct ManifestEnvelope: Codable {
+    let manifest: AddonManifest?
+}

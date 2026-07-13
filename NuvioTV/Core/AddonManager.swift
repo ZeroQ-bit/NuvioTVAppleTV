@@ -1,0 +1,221 @@
+import Foundation
+
+@MainActor
+final class AddonManager: ObservableObject {
+    @Published private(set) var addons: [InstalledAddon] = []
+    @Published var lastError: String?
+
+    /// Called after a user-initiated change so account sync can push. Not
+    /// fired while applying remote data (guarded by `suppressChange`).
+    var onLocalChange: (() -> Void)?
+    private var suppressChange = false
+
+    private static let storageKey = "nuvio.addons.v1"
+    static let cinemetaURL = "https://v3-cinemeta.strem.io/manifest.json"
+
+    private func notifyLocalChange() {
+        guard !suppressChange else { return }
+        onLocalChange?()
+    }
+
+    /// Normalizes any user/remote addon reference to its canonical
+    /// `…/manifest.json` URL (handles bare base URLs and `stremio://` links).
+    static func normalizeManifestURL(_ raw: String) -> String {
+        var s = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        if s.hasPrefix("stremio://") {
+            s = s.replacingOccurrences(of: "stremio://", with: "https://")
+        }
+        if !s.hasSuffix("manifest.json") {
+            s = s.hasSuffix("/") ? s + "manifest.json" : s + "/manifest.json"
+        }
+        return s
+    }
+
+    /// Installs any remote addon URLs not already present, preserving remote
+    /// order for the new ones. Manifests are fetched in parallel. Does not fire
+    /// `onLocalChange` (no echo back).
+    func applyRemote(urls: [String]) async {
+        suppressChange = true
+        defer { suppressChange = false }
+        let existing = Set(addons.map { $0.baseURL })
+        // Keep only genuinely-new addons, in their incoming order.
+        let toInstall: [String] = urls.map(Self.normalizeManifestURL).filter { normalized in
+            let base = normalized.hasSuffix("/manifest.json")
+                ? String(normalized.dropLast("/manifest.json".count)) : normalized
+            return !existing.contains(base)
+        }
+        guard !toInstall.isEmpty else { return }
+
+        // Fetch every new manifest concurrently, then apply in the original
+        // order so the installed list is deterministic.
+        let fetched = await withTaskGroup(of: (Int, String, AddonManifest)?.self) { group in
+            for (index, manifestURL) in toInstall.enumerated() {
+                group.addTask {
+                    guard let manifest = try? await StremioAPI.manifest(url: manifestURL) else { return nil }
+                    return (index, manifestURL, manifest)
+                }
+            }
+            var results: [(Int, String, AddonManifest)] = []
+            for await result in group { if let result { results.append(result) } }
+            return results.sorted { $0.0 < $1.0 }
+        }
+
+        for (_, manifestURL, manifest) in fetched {
+            let addon = InstalledAddon(manifestURL: manifestURL, manifest: manifest)
+            if let existing = addons.firstIndex(where: { $0.manifestURL == manifestURL }) {
+                addons[existing] = addon
+            } else {
+                addons.append(addon)
+            }
+        }
+        save()
+    }
+
+    private static let lastRefreshKey = "nuvio.addons.lastRefresh.v1"
+
+    init() {
+        load()
+        if addons.isEmpty {
+            addons = [Self.bundledCinemeta()]
+            save()
+        }
+        // Manifests barely ever change — skip the launch refresh when the last
+        // one is under an hour old (faster cold start, less addon traffic).
+        // The manual "Refresh Add-ons" button always forces it.
+        let last = UserDefaults.standard.double(forKey: Self.lastRefreshKey)
+        if Date().timeIntervalSince1970 - last > 3600 {
+            Task { await refreshManifests() }
+        }
+    }
+
+    var streamAddons: [InstalledAddon] {
+        addons.filter { $0.enabled && $0.manifest.providesStreams }
+    }
+
+    var catalogAddons: [InstalledAddon] {
+        addons.filter { $0.enabled && $0.manifest.providesCatalogs }
+    }
+
+    var subtitleAddons: [InstalledAddon] {
+        addons.filter { $0.enabled && $0.manifest.providesSubtitles }
+    }
+
+    func metaAddon(for type: String, id: String) -> InstalledAddon? {
+        addons.first { $0.manifest.providesMeta && $0.handles(id: id) }
+            ?? addons.first { $0.manifest.providesMeta }
+    }
+
+    func install(manifestURL rawURL: String) async throws {
+        let urlString = Self.normalizeManifestURL(rawURL)
+        let manifest = try await StremioAPI.manifest(url: urlString)
+        let addon = InstalledAddon(manifestURL: urlString, manifest: manifest)
+        if let existing = addons.firstIndex(where: { $0.manifestURL == urlString }) {
+            addons[existing] = addon
+        } else {
+            addons.append(addon)
+        }
+        save()
+        notifyLocalChange()
+    }
+
+    func remove(_ addon: InstalledAddon) {
+        addons.removeAll { $0.id == addon.id }
+        save()
+        notifyLocalChange()
+    }
+
+    func move(fromOffsets: IndexSet, toOffset: Int) {
+        addons.move(fromOffsets: fromOffsets, toOffset: toOffset)
+        save()
+        notifyLocalChange()
+    }
+
+    /// Reorder a single addon one slot up/down (the APK's row arrows).
+    func moveUp(_ addon: InstalledAddon) {
+        guard let i = addons.firstIndex(where: { $0.id == addon.id }), i > 0 else { return }
+        addons.swapAt(i, i - 1)
+        save()
+        notifyLocalChange()
+    }
+
+    func moveDown(_ addon: InstalledAddon) {
+        guard let i = addons.firstIndex(where: { $0.id == addon.id }), i < addons.count - 1 else { return }
+        addons.swapAt(i, i + 1)
+        save()
+        notifyLocalChange()
+    }
+
+    /// Enable/disable an addon in place (stays installed, contributes nothing
+    /// while off).
+    func setEnabled(_ addon: InstalledAddon, _ enabled: Bool) {
+        guard let i = addons.firstIndex(where: { $0.id == addon.id }) else { return }
+        addons[i].enabled = enabled
+        save()
+        notifyLocalChange()
+    }
+
+    /// Re-fetch every installed addon's manifest (the APK's "Refresh Add-ons").
+    func refresh() async {
+        await refreshManifests()
+    }
+
+    private func refreshManifests() async {
+        // Snapshot the current list, re-fetch every manifest in parallel, then
+        // reassemble in the original order.
+        let current = addons
+        guard !current.isEmpty else { return }
+        let refreshed = await withTaskGroup(of: (Int, InstalledAddon).self) { group in
+            for (index, addon) in current.enumerated() {
+                group.addTask {
+                    if let manifest = try? await StremioAPI.manifest(url: addon.manifestURL) {
+                        // Preserve the user's enable/disable choice across a refresh.
+                        return (index, InstalledAddon(manifestURL: addon.manifestURL, manifest: manifest, enabled: addon.enabled))
+                    }
+                    return (index, addon)
+                }
+            }
+            var results = [InstalledAddon?](repeating: nil, count: current.count)
+            for await (index, addon) in group { results[index] = addon }
+            return results.compactMap { $0 }
+        }
+        // Bail if the installed set changed while we were fetching (e.g. the
+        // user added/removed an addon), so we don't clobber their edit.
+        guard addons.map(\.manifestURL) == current.map(\.manifestURL) else { return }
+        addons = refreshed
+        save()
+        UserDefaults.standard.set(Date().timeIntervalSince1970, forKey: Self.lastRefreshKey)
+    }
+
+    private func load() {
+        guard let data = UserDefaults.standard.data(forKey: Self.storageKey),
+              let decoded = try? JSONDecoder().decode([InstalledAddon].self, from: data) else { return }
+        addons = decoded
+    }
+
+    private func save() {
+        guard let data = try? JSONEncoder().encode(addons) else { return }
+        UserDefaults.standard.set(data, forKey: Self.storageKey)
+    }
+
+    /// Seed manifest so the home screen has content before the first network
+    /// round-trip; replaced by the live manifest on launch.
+    private static func bundledCinemeta() -> InstalledAddon {
+        let manifest = AddonManifest(
+            id: "com.linvo.cinemeta",
+            name: "Cinemeta",
+            version: "3.0.0",
+            description: "The official addon for movie and series catalogs",
+            logo: nil,
+            types: ["movie", "series"],
+            idPrefixes: ["tt"],
+            catalogs: [
+                ManifestCatalog(type: "movie", id: "top", name: "Popular", extra: [CatalogExtra(name: "search", isRequired: false, options: nil)], extraRequired: nil, extraSupported: ["search"]),
+                ManifestCatalog(type: "series", id: "top", name: "Popular", extra: [CatalogExtra(name: "search", isRequired: false, options: nil)], extraRequired: nil, extraSupported: ["search"]),
+                ManifestCatalog(type: "movie", id: "imdbRating", name: "Featured", extra: nil, extraRequired: nil, extraSupported: nil),
+                ManifestCatalog(type: "series", id: "imdbRating", name: "Featured", extra: nil, extraRequired: nil, extraSupported: nil)
+            ],
+            resources: [.simple("catalog"), .simple("meta")]
+        )
+        return InstalledAddon(manifestURL: cinemetaURL, manifest: manifest)
+    }
+}

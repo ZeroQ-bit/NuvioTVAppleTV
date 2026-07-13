@@ -1,0 +1,2760 @@
+import AVFoundation
+import Combine
+import GameController
+import KSPlayer
+import SwiftUI
+
+struct PlaybackRequest: Identifiable {
+    let id = UUID()
+    let meta: MetaItem
+    let video: MetaVideo?
+    let entry: StreamEntry
+    let allEntries: [StreamEntry]
+    let resumePosition: Double?
+}
+
+enum PlayerOverlay: Equatable {
+    case none
+    case controls
+    case pauseInfo
+    case episodes
+    case sources
+    case audio
+    case subtitles
+    case speed
+    case upNext          // "Up Next" card counting down to the next episode
+    case stillWatching   // "Still watching?" gate after N auto-advances
+    case postPlay        // end-of-content overlay (replay / close)
+    case exitConfirm     // "Exit Player?" confirmation before leaving playback
+    case info            // Infuse-style pull-down file/media info panel
+    case engine          // playback-engine picker (Auto/Native/FFmpeg/VLC)
+    case error(String)
+}
+
+enum AspectMode: CaseIterable {
+    case fit, zoom, stretch
+
+    var label: String {
+        switch self {
+        case .fit: return "Fit"
+        case .zoom: return "Zoom"
+        case .stretch: return "Stretch"
+        }
+    }
+
+    /// Zoom/stretch are applied as a SwiftUI transform on the video host, NOT
+    /// via the engine's contentMode — KSPlayer's Metal render path (the
+    /// FFmpeg engine, i.e. every MKV) ignores UIView contentMode entirely, so
+    /// the button silently no-opped there. A geometric scale computed from the
+    /// video's natural size works identically on both engines.
+    func scale(video: CGSize, container: CGSize) -> CGSize {
+        guard video.width > 0, video.height > 0,
+              container.width > 0, container.height > 0 else {
+            return CGSize(width: 1, height: 1)
+        }
+        let videoAspect = video.width / video.height
+        let containerAspect = container.width / container.height
+        switch self {
+        case .fit:
+            return CGSize(width: 1, height: 1)
+        case .zoom:
+            // Uniformly scale the FITTED video until it fills the screen
+            // (crops the mismatched axis — kills letterbox/pillarbox bars).
+            let factor = max(containerAspect / videoAspect, videoAspect / containerAspect)
+            return CGSize(width: factor, height: factor)
+        case .stretch:
+            // Non-uniformly fill: distorts instead of cropping.
+            if videoAspect > containerAspect {
+                return CGSize(width: 1, height: videoAspect / containerAspect)
+            } else {
+                return CGSize(width: containerAspect / videoAspect, height: 1)
+            }
+        }
+    }
+}
+
+/// Engine-agnostic track descriptor covering embedded audio/subtitle tracks
+/// (both the AVPlayer- and FFmpeg-backed engines) and addon subtitles.
+struct TrackOption: Identifiable, Equatable {
+    enum Payload {
+        case off
+        case track(any MediaPlayerTrack)
+        case subtitle(any SubtitleInfo)
+        case vlcAudio(Int32)      // VLC audio track index
+        case vlcSubtitle(Int32)   // VLC subtitle track index (-1 = off)
+    }
+
+    let id: String
+    let displayName: String
+    let payload: Payload
+
+    static func == (lhs: TrackOption, rhs: TrackOption) -> Bool { lhs.id == rhs.id }
+}
+
+/// KSOptions that adapts frame pacing to whether the display could actually
+/// switch to the content's frame rate:
+/// - tvOS Match Content ON  → `updateVideo` switches the panel (24Hz/HDR),
+///   cadence is perfect, KSPlayer's default clock policy stays.
+/// - Match Content OFF → the panel is stuck at 60Hz (3:2 pulldown). KSPlayer's
+///   default policy drops every OTHER frame once video runs slightly late,
+///   which reads as stutter on the A10X. Here we soften that: mildly-late
+///   frames are SHOWN instead of dropped (late-by-40ms beats an 83ms hole in
+///   motion), keeping 1 drop in 3 so the clock still catches up. Emergency
+///   recovery (flush / seek / GOP drops for seriously-behind video) passes
+///   through untouched.
+final class NuvioPlayerOptions: KSOptions {
+    /// True when the display can't match content (stays 60Hz). Refreshed on
+    /// every `updateVideo` (KSPlayer's Metal path calls it on video setup; the
+    /// native path via applyNativeDisplayCriteria). Written on main, read on
+    /// the render clock thread — benign torn-read (a frame of stale policy).
+    var pulldown60Hz = false
+
+    /// OPT-IN display-mode switching. Some TVs mis-handshake the HDMI mode
+    /// switch that leaving HDR content triggers — the screen wedges grey until
+    /// the TV itself is power-cycled, which no amount of app-side sequencing
+    /// can fully fix. So by default the app NEVER touches
+    /// `preferredDisplayCriteria`: the Apple TV stays in its home-screen
+    /// format and tone-maps HDR/DV content into it, exactly like the Android
+    /// APK and Stremio (which never grey-screen). Settings → Playback →
+    /// "Match content display mode" turns switching back on for setups that
+    /// handle it — and when on, the switch is done in the gentlest form we
+    /// can (see updateVideo) to lower the odds of a wedge.
+    var matchDisplayCriteria = false
+
+    /// The dynamic range last requested from the display, so repeat calls
+    /// with identical criteria don't re-hit the HDMI handshake.
+    private var lastAppliedDynamicRange: Int32?
+
+    /// Capability-gated, harm-reduced display-mode request. Two mitigations
+    /// over KSPlayer's stock behavior, both aimed at the grey-screen wedge:
+    ///
+    /// 1. DYNAMIC RANGE ONLY, never refresh rate (refreshRate 0 = "keep
+    ///    current"). Stock KSOptions requests DR *and* frame rate together —
+    ///    a compound HDMI renegotiation. Switching only the dynamic range is
+    ///    a lighter handshake, less likely to hang the TV's receiver. (The
+    ///    cost: 24fps content runs under 60Hz pulldown, so the softened-drop
+    ///    pacing below stays on — pulldown60Hz is always true here.)
+    /// 2. DE-DUP. KSPlayer calls this on both the fps and formatDescription
+    ///    didSet, so the same criteria arrives 2–3× in a row; re-requesting
+    ///    an identical mode is a pointless extra handshake, so we skip it.
+    ///
+    /// The DR itself is clamped to what the TV actually advertises
+    /// (`DynamicRange.availableHDRModes`): DV maps to HDR10 (the Metal path
+    /// outputs DV as HDR10), an unsupported HDR flavor falls back to the best
+    /// supported one, and an SDR-only TV is left alone entirely.
+    ///
+    /// None of this can *guarantee* no grey screen — a flaky HDMI link can
+    /// still wedge on any switch — which is why the whole thing is opt-in.
+    override func updateVideo(refreshRate _: Float, isDovi _: Bool, formatDescription: CMFormatDescription?) {
+        // We never request a refresh-rate switch, so a mismatched panel stays
+        // at its home rate (typically 60Hz): keep the pulldown softening on.
+        pulldown60Hz = true
+        guard matchDisplayCriteria,
+              let displayManager = UIApplication.shared.windows.first?.avDisplayManager,
+              displayManager.isDisplayCriteriaMatchingEnabled,
+              let formatDescription
+        else { return }
+        var target = formatDescription.dynamicRange
+        // FFmpeg/Metal renders DV as HDR10 output (KSPlayer's own mapping).
+        if target == .dolbyVision { target = .hdr10 }
+        let available = DynamicRange.availableHDRModes   // [.sdr] when none
+        if target != .sdr, !available.contains(target) {
+            if available.contains(.hdr10) { target = .hdr10 }
+            else if available.contains(.hlg) { target = .hlg }
+            else { target = .sdr }
+        }
+        guard lastAppliedDynamicRange != target.rawValue else { return }
+        lastAppliedDynamicRange = target.rawValue
+        // refreshRate 0 → any rate acceptable: vary ONLY the dynamic range.
+        displayManager.preferredDisplayCriteria = AVDisplayCriteria(
+            refreshRate: 0, videoDynamicRange: target.rawValue
+        )
+    }
+
+    /// Counts softened drops so every 3rd still drops (catch-up pressure).
+    private var softenCount = 0
+
+    override func videoClockSync(main: KSClock, nextVideoTime: TimeInterval, fps: Double, frameCount: Int) -> (Double, ClockProcessType) {
+        let (diff, action) = super.videoClockSync(main: main, nextVideoTime: nextVideoTime, fps: fps, frameCount: frameCount)
+        // Only intervene at 60Hz pulldown, only for plain frame drops, and only
+        // when lateness is mild — anything worse keeps default recovery.
+        guard pulldown60Hz, action == .dropNextFrame, diff > -0.5 else { return (diff, action) }
+        softenCount &+= 1
+        return softenCount % 3 == 0 ? (diff, action) : (diff, .next)
+    }
+}
+
+/// Time state published separately from the main view model so the several-
+/// times-per-second position ticks only re-render the few small views that
+/// display time (timeline, HUDs, readouts) — NOT the whole player ZStack with
+/// the video view inside it. This split is the core smoothness fix.
+@MainActor
+final class PlaybackClock: ObservableObject {
+    @Published var position: Double = 0
+    @Published var duration: Double = 0
+    @Published var buffered: Double = 0
+    /// Live scrub position, updated many times per second by the trackpad.
+    /// Lives HERE (not on the view model) so scrubbing only re-renders the
+    /// small time views, not the whole player ZStack — the scrub-choppiness
+    /// fix, same principle as the position ticks.
+    @Published var scrubTarget: Double?
+    /// Wheel indicator angle, likewise high-frequency.
+    @Published var wheelAngle: Double = 0
+}
+
+@MainActor
+final class PlayerViewModel: ObservableObject {
+    // Playback state. Time values live on `clock` (see PlaybackClock); the
+    // mirrors here are non-published so internal logic can read them without
+    // invalidating every view on each tick.
+    @Published private(set) var isPlaying = false {
+        didSet {
+            guard isPlaying != oldValue else { return }
+            // Keep the screen awake ONLY while actually playing. When paused,
+            // browsing, or after the player closes, the idle timer must be
+            // re-enabled or the Apple TV never shows its screensaver or sleeps
+            // (returning from a screensaver mid-pause is handled by the
+            // background/foreground resync). Set on main; VM is @MainActor.
+            UIApplication.shared.isIdleTimerDisabled = isPlaying
+        }
+    }
+    @Published private(set) var isBuffering = true {
+        didSet { updateBufferSpinner() }
+    }
+    /// Debounced buffering UI. Skips/seeks cause sub-half-second `.buffering`
+    /// blips, and flashing the spinner card for those reads as a white glitch
+    /// over the video. Only surface the spinner when buffering PERSISTS.
+    @Published private(set) var showBufferSpinner = false
+    private var bufferSpinnerTask: Task<Void, Never>?
+
+    private func updateBufferSpinner() {
+        bufferSpinnerTask?.cancel()
+        if isBuffering {
+            guard !showBufferSpinner else { return }
+            bufferSpinnerTask = Task { [weak self] in
+                try? await Task.sleep(nanoseconds: 500_000_000)
+                guard !Task.isCancelled, let self, self.isBuffering else { return }
+                self.showBufferSpinner = true
+            }
+        } else {
+            showBufferSpinner = false
+        }
+    }
+    /// False until the stream first becomes ready. Drives the full-screen
+    /// Nuvio-style loading backdrop (shown only during the initial load); once
+    /// playing, mid-stream rebuffers use a light spinner instead.
+    @Published private(set) var hasStartedPlayback = false
+    private(set) var position: Double = 0
+    private(set) var duration: Double = 0
+    private(set) var buffered: Double = 0
+    let clock = PlaybackClock()
+    /// Which engine KSPlayerLayer is currently using ("Native" / "FFmpeg").
+    @Published private(set) var engineName = "Native"
+
+    // UI state
+    @Published var overlay: PlayerOverlay = .none
+    /// Coarse "a scrub is in progress" flag (flips twice per gesture) so the
+    /// player can show/hide the scrub bar. The fine-grained target lives on
+    /// `clock.scrubTarget`.
+    @Published private(set) var isScrubbing = false
+    @Published var toast: String?
+    @Published var pendingSeekDelta: Double = 0
+    /// Bumped whenever the underlying player (and thus its video view) may
+    /// have changed, e.g. after engine failover.
+    @Published private(set) var videoRefreshID = UUID()
+
+    // Tracks & modes
+    @Published private(set) var audioOptions: [TrackOption] = []
+    @Published private(set) var subtitleOptions: [TrackOption] = []
+    @Published var selectedAudioID: String?
+    @Published var selectedSubtitleID: String?
+    @Published var aspectMode: AspectMode = .fit
+    @Published var playbackSpeed: Float = 1.0
+
+    // Content
+    let meta: MetaItem
+    @Published private(set) var currentVideo: MetaVideo?
+    @Published private(set) var currentEntry: StreamEntry
+    @Published private(set) var allEntries: [StreamEntry]
+    @Published private(set) var isSwitchingSource = false
+
+    private(set) var playerLayer: KSPlayerLayer?
+    /// The VLC engine, active only when the VLC playback engine is selected;
+    /// mutually exclusive with `playerLayer`.
+    private(set) var vlcEngine: VLCEngine?
+    var usingVLC: Bool { vlcEngine != nil }
+    /// The UIView the active engine renders into (KSPlayer's player view or
+    /// VLC's drawable), handed to PlayerVideoView.
+    var activeVideoView: UIView? { vlcEngine?.videoView ?? playerLayer?.player.view }
+    let subtitleModel = SubtitleModel()
+
+    var onDismiss: (() -> Void)?
+
+    // MARK: - Engine-agnostic transport (branch KS ↔ VLC)
+
+    private func enginePlay() {
+        if let vlcEngine { vlcEngine.play() } else { playerLayer?.play() }
+    }
+    private func enginePause() {
+        if let vlcEngine { vlcEngine.pause() } else { playerLayer?.pause() }
+    }
+    private func engineSeek(to seconds: Double, autoPlay: Bool) {
+        if let vlcEngine {
+            vlcEngine.seek(to: seconds)
+            if autoPlay { vlcEngine.play() }
+        } else {
+            playerLayer?.seek(time: seconds, autoPlay: autoPlay) { _ in }
+        }
+    }
+
+    // Post-play / auto-next
+    let settings: PlayerSettings
+    /// The episode queued in the Up Next / Still Watching overlays.
+    @Published private(set) var upNextEpisode: MetaVideo?
+    /// Remaining seconds on the Up Next countdown (nil = no active countdown).
+    @Published private(set) var upNextCountdown: Int?
+    /// The countdown's starting value, so the Up Next card can draw a progress
+    /// bar (remaining / total). 0 when there's no active countdown.
+    @Published private(set) var upNextTotalSeconds: Int = 0
+    private var countdownTask: Task<Void, Never>?
+    /// True once an Up Next / auto-advance has been triggered for the current
+    /// episode, so the threshold fires at most once per episode.
+    private var autoAdvanceArmed = false
+    /// Consecutive episodes advanced without a user "keep watching" interaction,
+    /// feeding the Still Watching gate.
+    private var consecutiveAutoAdvances = 0
+
+    private let addonManager: AddonManager
+    private let progressStore: ProgressStore
+    private var hideControlsTask: Task<Void, Never>?
+    private var scrubTimeoutTask: Task<Void, Never>?
+    private var seekDebounceTask: Task<Void, Never>?
+    private var toastTask: Task<Void, Never>?
+    private var lastProgressSave = Date.distantPast
+    private var lastSubtitleSearchAt: Double = -1
+    private var pendingResume: Double?
+    /// Options of the stream currently loading, kept for open-timing logs.
+    private var currentOptions: KSOptions?
+    private var loadStartedAt: Date?
+    private var currentURL: URL?
+
+    // Scrub preview thumbnails, generated in the background over a separate
+    // FFmpeg context once playback is underway (Infuse builds its previews the
+    // same way). Sorted by time; the scrub HUD picks the nearest frame.
+    @Published private(set) var scrubThumbnails: [FFThumbnail] = []
+    private var thumbnailTask: Task<Void, Never>?
+    private var thumbnailsStarted = false
+
+    // Initial-load phases shown on the loading backdrop: "Loading" while the
+    // stream opens, then "Caching" while a deep forward buffer is built with
+    // playback held, so the movie starts smooth instead of stuttering on a
+    // thin buffer.
+    enum LoadPhase { case loading, caching }
+    @Published private(set) var loadPhase: LoadPhase? = .loading
+    @Published private(set) var cacheProgress: Int = 0
+    private var cacheTask: Task<Void, Never>?
+    /// Forward-buffer target before first playback begins (one minute, like
+    /// Netflix/Infuse); after release the reader keeps caching ahead up to
+    /// maxBufferDuration continuously, playing or paused.
+    /// Forward-buffer target before first playback — set per-load by the
+    /// size tier (0 = skip the hold entirely; small files start instantly).
+    private var cacheTargetSeconds: Double = 15
+    /// Hard cap on the caching wait so a slow source still starts eventually.
+    private let cacheMaxWaitSeconds: Double = 20
+
+    /// Rough bitrate proxy used to tune buffers per stream: a 1 GB episode
+    /// and a 60 GB remux need very different memory/network envelopes.
+    enum SizeTier {
+        case small      // < 2 GB — low bitrate, start instantly, buffer deep
+        case medium     // 2–10 GB
+        case large      // > 10 GB — high bitrate, cap memory, big socket reads
+        case unknown
+
+        init(bytes: Int64?) {
+            guard let bytes, bytes > 0 else { self = .unknown; return }
+            switch bytes {
+            case ..<(2 << 30): self = .small
+            case ..<(10 << 30): self = .medium
+            default: self = .large
+            }
+        }
+    }
+
+    private static var engineConfigured = false
+
+    private static func configureEngineDefaults() {
+        guard !engineConfigured else { return }
+        engineConfigured = true
+        // Native AVPlayer first (HLS/MP4/MOV hardware path); on failure
+        // KSPlayerLayer transparently retries with the FFmpeg engine, which
+        // covers MKV, AVI, FLV, TS and friends.
+        KSOptions.firstPlayerType = KSAVPlayer.self
+        KSOptions.secondPlayerType = KSMEPlayer.self
+        KSOptions.isAutoPlay = true
+        KSOptions.logLevel = .error
+        // Fast startup: begin rendering as soon as the first frames decode
+        // (isSecondOpen) instead of waiting for a comfortable buffer.
+        //
+        // preferredForwardBufferDuration is NOT the smoothness buffer — it's
+        // the gate KSPlayer waits on before (re)starting playback: seeks wait
+        // for half of it and mid-play stalls wait for ALL of it. On a
+        // high-bitrate debrid remux a large value means every stall/seek
+        // downloads tens of seconds of video before the picture moves again.
+        // Keep the gate SMALL for instant recovery; smoothness comes from the
+        // deep background buffer (maxBufferDuration), which keeps filling
+        // ahead regardless of this value.
+        KSOptions.isSecondOpen = true
+        KSOptions.preferredForwardBufferDuration = 6
+        // The continuous ahead-cache: the reader keeps filling toward this cap
+        // the whole time — playing or paused. Capped at 45s: a high-bitrate
+        // remux at 120s could hold >1 GB of compressed packets, which is real
+        // memory pressure on the 3 GB Apple TV 4K (gen 1) — and memory
+        // pressure there reads as SYSTEM-WIDE lag, not just player lag.
+        KSOptions.maxBufferDuration = 45
+        // Decode off the render thread: the synchronous path stalls the video
+        // loop under heavy 4K content on the A10X (the "jumpy" playback).
+        KSOptions.asynchronousDecompression = true
+        KSOptions.hardwareDecode = true
+        // Keyframe seeks are near-instant; frame-accurate seeks can take
+        // seconds on long-GOP content.
+        KSOptions.isAccurateSeek = false
+        // KSPlayer stamps this font onto every text cue, overriding whatever
+        // the SwiftUI overlay styles — its tvOS default is a billboard-sized
+        // 58pt. Overridden per-session from PlayerSettings in init.
+        SubtitleModel.textFontSize = 36
+        SubtitleModel.textBold = false
+    }
+
+    init(
+        request: PlaybackRequest,
+        addonManager: AddonManager,
+        progressStore: ProgressStore,
+        settings: PlayerSettings = .default
+    ) {
+        self.meta = request.meta
+        self.currentVideo = request.video
+        self.currentEntry = request.entry
+        self.allEntries = request.allEntries
+        self.addonManager = addonManager
+        self.progressStore = progressStore
+        self.settings = settings
+        self.pendingResume = request.resumePosition
+
+        Self.configureEngineDefaults()
+        // Subtitle presentation follows the user's Playback settings.
+        SubtitleModel.textFontSize = CGFloat(settings.subtitleSize)
+        SubtitleModel.textBold = settings.subtitleBold
+        // Audio output for the FFmpeg engine, per-session (KSMEPlayer snapshots
+        // the type at creation). AudioRendererPlayer =
+        // AVSampleBufferAudioRenderer: Dolby Atmos/spatial rendering and
+        // cheaper lossless (TrueHD/DTS-HD) audio on the A10X. Capability-
+        // gated by default: Auto turns it on only when the current output
+        // route (TV/receiver/soundbar) reports spatial-audio support — Atmos
+        // setups get the Atmos-capable path, everything else keeps the
+        // battle-tested AVAudioEngine. Settings can force either side.
+        let useRenderer: Bool
+        switch settings.audioOutputMode {
+        case .auto:
+            useRenderer = AVAudioSession.sharedInstance().currentRoute.outputs
+                .contains { $0.isSpatialAudioEnabled }
+        case .renderer:
+            useRenderer = true
+        case .engine:
+            useRenderer = false
+        }
+        KSOptions.audioPlayerType = useRenderer
+            ? AudioRendererPlayer.self : AudioEnginePlayer.self
+        fetchEnrichedMeta()
+        configureWheelTracking()
+        NotificationCenter.default.addObserver(
+            forName: .GCControllerDidConnect, object: nil, queue: .main
+        ) { [weak self] _ in
+            MainActor.assumeIsolated { self?.configureWheelTracking() }
+        }
+        registerLifecycleObservers()
+        // NB: the idle timer is managed by `isPlaying` (kept awake only while
+        // actually playing) — NOT disabled for the whole session, which used
+        // to leave the Apple TV never sleeping / never showing its screensaver.
+        load(entry: request.entry)
+    }
+
+    // MARK: - App background / foreground
+
+    /// True once a Home-button background happened mid-session, so the
+    /// foreground handler knows to resync (and ignores stray foreground
+    /// notifications that weren't preceded by a real background).
+    private var didBackground = false
+    /// True while the just-foregrounded pipeline is being flushed/resynced —
+    /// PlayerScreen holds a black cover over the video for this so the
+    /// undecoded garbage frames (the black/green/red flash) never show.
+    @Published private(set) var isResyncing = false
+    private var resyncClearTask: Task<Void, Never>?
+
+    private func registerLifecycleObservers() {
+        let nc = NotificationCenter.default
+        // Pressing Home suspends the app. tvOS does NOT pause the player for
+        // us — the decoder keeps queuing frames and the audio session drops,
+        // so on return the video races to catch up (fast-forward) against
+        // dead/stale audio. Pause cleanly here instead.
+        nc.addObserver(
+            forName: UIApplication.didEnterBackgroundNotification, object: nil, queue: .main
+        ) { [weak self] _ in
+            MainActor.assumeIsolated { self?.handleEnterBackground() }
+        }
+        nc.addObserver(
+            forName: UIApplication.willEnterForegroundNotification, object: nil, queue: .main
+        ) { [weak self] _ in
+            MainActor.assumeIsolated { self?.handleEnterForeground() }
+        }
+    }
+
+    private func handleEnterBackground() {
+        guard hasStartedPlayback, !isExiting else { return }
+        didBackground = true
+        enginePause()
+        pausedAt = Date()
+        // Land the viewer on the pause overlay so returning shows a clean
+        // "paused here" state, not a frozen bare frame.
+        if overlay == .none { overlay = .pauseInfo }
+        saveProgress()
+    }
+
+    /// Returning from background: the suspended decode pipeline is stale
+    /// (garbage frames, A/V desync, stale audio buffers). Flush and
+    /// re-establish sync with an in-place seek and STAY paused where they
+    /// left off — pressing Play then resumes cleanly, instead of resuming
+    /// into the broken pipeline (the fast-forward / stale-audio bug). Never
+    /// auto-resumes: the user asked to just press play to continue.
+    private func handleEnterForeground() {
+        guard didBackground, hasStartedPlayback, !isExiting else { return }
+        didBackground = false
+        isResyncing = true
+        let target = max(position - 1, 0)
+        if let vlcEngine {
+            vlcEngine.seek(to: target)
+            vlcEngine.pause()
+            scheduleResyncClear(after: 0.7)
+        } else {
+            playerLayer?.pause()
+            playerLayer?.seek(time: target, autoPlay: false) { [weak self] _ in
+                MainActor.assumeIsolated { self?.scheduleResyncClear(after: 0.2) }
+            }
+            // Safety net in case the seek callback never fires.
+            scheduleResyncClear(after: 1.5)
+        }
+        position = target
+        clock.position = target
+        isPlaying = false
+        pausedAt = Date()
+    }
+
+    /// Clear the black resync cover once — the earliest scheduled clear wins,
+    /// so the seek callback (fast) supersedes the safety-net timeout (slow).
+    private func scheduleResyncClear(after seconds: Double) {
+        guard isResyncing else { return }
+        resyncClearTask?.cancel()
+        resyncClearTask = Task { [weak self] in
+            try? await Task.sleep(nanoseconds: UInt64(seconds * 1_000_000_000))
+            guard !Task.isCancelled else { return }
+            self?.isResyncing = false
+        }
+    }
+
+    // MARK: - Loading
+
+    private func load(entry: StreamEntry) {
+        guard let urlString = entry.stream.url, let url = URL(string: urlString) else {
+            overlay = .error("This source has no playable link.")
+            return
+        }
+        audioOptions = []
+        subtitleOptions = []
+        selectedSubtitleID = nil
+        duration = 0
+        buffered = 0
+        position = 0
+        clock.position = 0
+        clock.duration = 0
+        clock.buffered = 0
+        isBuffering = true
+        pausedAt = nil
+
+        // VLC engine path: self-contained, skips all the KSPlayer/FFmpeg setup.
+        if effectiveEngine == .vlc {
+            loadViaVLC(url: url)
+            return
+        }
+        // Coming FROM the VLC engine (engine switch, or failover off a VLC
+        // error): shut it down or both engines would run at once.
+        vlcEngine?.stop()
+        vlcEngine = nil
+
+        let options = NuvioPlayerOptions()
+        // Display-mode switching is opt-in (see matchDisplayCriteria doc); and
+        // even when on it only varies dynamic range, never refresh rate — so
+        // the panel stays at its home rate and the softened-drop pacing is
+        // always the right policy for 24fps content.
+        options.matchDisplayCriteria = settings.matchContentDisplayMode
+        options.pulldown60Hz = true
+
+        // Route containers AVPlayer can't handle (the typical debrid remux is
+        // an MKV) STRAIGHT to the FFmpeg engine. Otherwise KSPlayer tries the
+        // native engine first — and on a 50 GB remote MKV AVPlayer can grind
+        // for MINUTES before giving up, only then failing over to FFmpeg,
+        // which re-downloads and re-probes from scratch.
+        //
+        // Container detection: URL path first; if the link is extensionless
+        // (TorBox `requestdl?…`, some unrestrict endpoints) fall back to the
+        // resolved filename, which the debrid resolver puts in the stream
+        // title. A still-unknown remote file defaults to FFmpeg — it plays
+        // everything (including MP4/HLS), while a wrong native-first guess
+        // costs a minutes-long AVPlayer stall.
+        let ffmpegContainers: Set<String> = ["mkv", "avi", "flv", "wmv", "ts", "m2ts", "webm"]
+        let nativeContainers: Set<String> = ["mp4", "m4v", "mov", "m3u8", "mp3", "aac"]
+        var ext = url.pathExtension.lowercased()
+        if ext.isEmpty,
+           let filename = currentEntry.stream.title,
+           let dotExt = filename.split(separator: ".").last.map({ String($0).lowercased() }),
+           ffmpegContainers.contains(dotExt) || nativeContainers.contains(dotExt) {
+            ext = dotExt
+        }
+        // Engine selection: the user's Settings choice wins; Auto is now
+        // FFmpeg-FIRST by default and only hands a file to AVPlayer when the
+        // container is a KNOWN streaming-friendly one (mp4/mov/hls/…). This
+        // kills the "AVPlayer opens first, can't handle it, grinds, THEN fails
+        // over to FFmpeg and re-opens from scratch" double-open on anything
+        // ambiguous — an unknown/odd extension used to go native-first and
+        // stall. Real mp4/HLS still take the fast native path; everything else
+        // (mkv, extensionless debrid links, unknown) opens once on FFmpeg,
+        // exactly like a single-engine player (mpv). The OTHER engine remains
+        // second for genuine failover.
+        let needsFFmpeg: Bool
+        switch effectiveEngine {
+        case .native: needsFFmpeg = false
+        case .ffmpeg: needsFFmpeg = true
+        // .vlc returns before reaching here; route by container as a fallback.
+        case .auto, .vlc: needsFFmpeg = !nativeContainers.contains(ext)
+        }
+        KSOptions.firstPlayerType = needsFFmpeg ? KSMEPlayer.self : KSAVPlayer.self
+        KSOptions.secondPlayerType = needsFFmpeg ? KSAVPlayer.self : KSMEPlayer.self
+
+        // Fast probe for EVERY direct file (only HLS playlists need the full
+        // scan). This previously applied only to known extensions — an
+        // extensionless debrid link paid FFmpeg's default probe (5 MB + up to
+        // 5 SECONDS of stream content) over remote HTTP, which alone accounted
+        // for most of the "big file takes forever to open".
+        if ext != "m3u8" {
+            options.probesize = 2 << 20              // 2 MB
+            options.maxAnalyzeDuration = 1_000_000   // 1s (microseconds)
+        }
+
+        // Belt-and-braces: pin the per-instance decode flags (the instance
+        // snapshots the statics at init; make the intent explicit).
+        options.hardwareDecode = true
+        options.asynchronousDecompression = true
+
+        // ---- Size-adaptive buffering (file size as a bitrate proxy) ----
+        // One setting cannot fit both a 1 GB episode and a 60 GB remux:
+        // seconds-of-packets scale with bitrate, so a fixed "45s" is either
+        // wasted latency (small) or a memory bomb (huge) on the 3 GB box.
+        // NOTE on the caps: KSPlayer's reader fills to maxBufferDuration,
+        // sleeps, and resumes only once the buffer drains to HALF — so the cap
+        // also sets the size of the periodic refill burst (network + demux
+        // spike ≈ cap/2 seconds of data). On high-bitrate files a big cap
+        // meant a CPU/network burst every ~15-20s that visibly nicked
+        // playback on the A10X; tighter caps trade a slightly shallower
+        // cushion for smaller, gentler refills.
+        //
+        // START POLICY: we no longer HOLD playback to pre-fill a cache before
+        // starting. Every tier now starts on the first keyframe (cacheTarget=0)
+        // and relies on KSPlayer's own buffering to pause/resume if the cache
+        // underruns mid-stream — the same "start now, rebuffer only if needed"
+        // model mpv uses (cache-pause). The old 12-15s pre-start hold on
+        // medium/large files was the single biggest self-imposed open delay.
+        // maxBufferDuration / socketBuffer stay tier-adaptive (they size the
+        // background cache, not the start delay). If a huge remux stutters in
+        // the first seconds on the A10X, reintroduce a small hold for .large.
+        let tier = SizeTier(bytes: entry.stream.behaviorHints?.videoSize)
+        let socketBuffer: Int
+        cacheTargetSeconds = 0               // start on first keyframe, no hold
+        switch tier {
+        case .small:
+            options.maxBufferDuration = 90    // low bitrate — bursts are cheap
+            socketBuffer = 2 << 20
+        case .medium, .unknown:
+            options.maxBufferDuration = 36    // refill burst ≈ 18s of data
+            socketBuffer = 4 << 20
+        case .large:
+            options.maxBufferDuration = 24    // refill burst ≈ 12s of data
+            socketBuffer = 8 << 20            // fewer, bigger reads
+        }
+
+        // Native path: preferredForwardBufferDuration maps STRAIGHT into
+        // AVPlayerItem (KSAVPlayer pins automaticallyWaitsToMinimizeStalling
+        // to false, so this value is AVPlayer's entire read-ahead license).
+        // 6s starved remote playback; give it a real cushion. The FFmpeg path
+        // keeps the small 6s gate — there it controls stall-recovery waits,
+        // not read-ahead (maxBufferDuration does that).
+        if !needsFFmpeg {
+            options.preferredForwardBufferDuration = 12
+        } else {
+            // FFmpeg path: this is the (re)start gate, not the smoothness
+            // buffer (maxBufferDuration does that, and keeps filling
+            // regardless). 3s instead of the static 6s halves how much a
+            // seek/stall downloads before the picture moves again.
+            options.preferredForwardBufferDuration = 3
+        }
+
+        // FFmpeg-engine tuning (ignored by the AVPlayer path): a large socket
+        // read buffer sustains throughput on high-bandwidth debrid CDNs,
+        // reconnect-on-drop rides out transient network dips, and HTTP
+        // keep-alive (multiple_requests) reuses one TLS connection across the
+        // several range requests an MKV open needs (header → cues at the file
+        // tail → back) instead of paying a fresh handshake for each.
+        options.formatContextOptions["buffer_size"] = socketBuffer
+        options.formatContextOptions["reconnect"] = 1
+        options.formatContextOptions["reconnect_streamed"] = 1
+        options.formatContextOptions["reconnect_delay_max"] = 5
+        options.formatContextOptions["multiple_requests"] = 1
+        // Also reconnect on HTTP-level errors (5xx from a flaky CDN edge), not
+        // just dropped sockets.
+        options.formatContextOptions["reconnect_on_network_error"] = 1
+        // Hard ceiling on any single blocking read/write (µs). Without it a
+        // dead CDN connection hangs the demuxer forever — the "player froze
+        // and never errored" case; with it FFmpeg errors out and our failover
+        // kicks in. 20s matches the app's URLSession request timeout.
+        options.formatContextOptions["rw_timeout"] = 20_000_000
+        // Small HTTP requests (range probes, HLS playlists) shouldn't wait on
+        // Nagle coalescing.
+        options.formatContextOptions["tcp_nodelay"] = 1
+        // HLS: reuse one connection across segment fetches.
+        options.formatContextOptions["http_persistent"] = 1
+        // SOFTWARE-decode relief (ignored whenever VideoToolbox hardware path
+        // is active — which is the normal case): when a file falls back to CPU
+        // decode (some 10-bit HEVC, AV1, exotic profiles), skipping the
+        // in-loop deblocking filter cuts a big slice of per-frame CPU on the
+        // A10X. Slight blockiness in dark gradients beats a slideshow.
+        // (threads=auto is already KSPlayer's default.)
+        options.decoderOptions["skip_loop_filter"] = "all"
+        currentOptions = options
+        loadStartedAt = Date()
+        currentURL = url
+        startLoadWatchdog()
+        thumbnailTask?.cancel()
+        thumbnailsStarted = false
+        scrubThumbnails = []
+        cacheTask?.cancel()
+        addonSubtitlesFetched = false
+        subtitleAutoApplied = false
+        chapters = []
+        skipIntroActive = false
+        if !hasStartedPlayback {
+            loadPhase = .loading
+            cacheProgress = 0
+        }
+        NSLog("[NuvioPlayer] load start ext=%@ engine=%@ url-host=%@",
+              ext.isEmpty ? "(none)" : ext,
+              needsFFmpeg ? "FFmpeg" : "Native",
+              url.host ?? "?")
+        subtitleModel.selectedSubtitleInfo = nil
+        subtitleModel.url = url
+
+        if let playerLayer {
+            playerLayer.set(url: url, options: options)
+        } else {
+            playerLayer = KSPlayerLayer(url: url, options: options, delegate: self)
+        }
+        videoRefreshID = UUID()
+    }
+
+    private func refreshEngineName() {
+        guard let player = playerLayer?.player else { return }
+        engineName = player is KSMEPlayer ? "FFmpeg" : "Native"
+    }
+
+    /// Match Frame Rate / Match Dynamic Range for the NATIVE engine. On the
+    /// FFmpeg/Metal path KSPlayer's MetalPlayView drives
+    /// `KSOptions.updateVideo` itself (per-video, with the decoded format),
+    /// which asks tvOS to switch the display to the content's refresh rate +
+    /// dynamic range — the thing that kills 3:2 pulldown judder and washed-out
+    /// HDR. The AVPlayer path never calls it, so 24fps MP4/HLS stayed at 60Hz.
+    /// Drive it here on ready. `updateVideo` is gated internally on the user's
+    /// tvOS Match Content setting, and `playerLayerDeinit` resets the criteria
+    /// on teardown — both already handled by KSPlayer.
+    private func applyNativeDisplayCriteria() {
+        guard let player = playerLayer?.player, !(player is KSMEPlayer) else { return }
+        guard let track = player.tracks(mediaType: .video).first(where: \.isEnabled)
+            ?? player.tracks(mediaType: .video).first,
+            track.nominalFrameRate > 0
+        else { return }
+        currentOptions?.updateVideo(
+            refreshRate: track.nominalFrameRate,
+            isDovi: track.dovi != nil,
+            formatDescription: track.formatDescription
+        )
+    }
+
+    // MARK: - VLC engine path
+
+    private func loadViaVLC(url: URL) {
+        // Tear down any KSPlayer instance so the two engines never coexist.
+        playerLayer?.stop()
+        playerLayer = nil
+
+        currentURL = url
+        loadStartedAt = Date()
+        startLoadWatchdog()
+        thumbnailTask?.cancel()
+        thumbnailsStarted = false
+        scrubThumbnails = []
+        cacheTask?.cancel()
+        addonSubtitlesFetched = false
+        subtitleAutoApplied = false
+        chapters = []
+        skipIntroActive = false
+        engineName = "VLC"
+        if !hasStartedPlayback {
+            loadPhase = .loading   // VLC never enters the .caching hold
+            cacheProgress = 0
+        }
+
+        let engine = vlcEngine ?? VLCEngine()
+        vlcEngine = engine
+        engine.onState = { [weak self] playing, buffering, ended, errored in
+            self?.vlcStateChanged(playing: playing, buffering: buffering, ended: ended, errored: errored)
+        }
+        engine.onTime = { [weak self] current, total in
+            self?.vlcTimeChanged(current: current, total: total)
+        }
+        // Size-adaptive pre-buffer: enough to be smooth for the tier's likely
+        // bitrate without hoarding RAM on the 3 GB Apple TV or making small
+        // files slow to start.
+        let cachingMs: Int
+        switch SizeTier(bytes: currentEntry.stream.behaviorHints?.videoSize) {
+        case .small: cachingMs = 6000
+        case .medium, .unknown: cachingMs = 12000
+        case .large: cachingMs = 20000
+        }
+        engine.load(url: url, networkCachingMs: cachingMs)
+        engine.play()
+        NSLog("[NuvioPlayer] load start engine=VLC url-host=%@", url.host ?? "?")
+        videoRefreshID = UUID()
+    }
+
+    private func vlcStateChanged(playing: Bool, buffering: Bool, ended: Bool, errored: Bool) {
+        if errored {
+            isPlaying = false
+            isBuffering = false
+            attemptFailover(afterError: NSError(
+                domain: "VLC", code: -1,
+                userInfo: [NSLocalizedDescriptionKey: "VLC could not play this source."]
+            ))
+            return
+        }
+        if ended {
+            isPlaying = false
+            handlePlayedToEnd()
+            return
+        }
+        isPlaying = playing
+        isBuffering = buffering && !playing
+        if playing { markLoadStarted() }   // VLC is alive → disarm watchdog
+        // Same stale-connection bookkeeping as the KSPlayer path.
+        if playing || buffering {
+            pausedAt = nil
+        } else if hasStartedPlayback, pausedAt == nil {
+            pausedAt = Date()
+        }
+
+        if playing, !hasStartedPlayback {
+            hasStartedPlayback = true
+            loadPhase = nil
+            videoRefreshID = UUID()   // re-attach the VLC drawable view
+            if let engine = vlcEngine, engine.naturalSize != .zero {
+                videoNaturalSize = engine.naturalSize
+            }
+            loadVLCTracks()
+            if let resume = pendingResume, resume > 5,
+               duration == 0 || resume < duration - 30 {
+                vlcEngine?.seek(to: resume)
+            }
+            pendingResume = nil
+            if playbackSpeed != 1 { vlcEngine?.rate = playbackSpeed }
+            fetchAddonSubtitles()
+            startThumbnailsIfNeeded()
+            if overlay == .none { showControls() }
+        }
+    }
+
+    private func vlcTimeChanged(current: Double, total: Double) {
+        if current > 0, !hasStartedPlayback { hasStartedPlayback = true; loadPhase = nil }
+        position = current
+        if total > 0 { duration = total }
+        buffered = 0   // VLC doesn't expose an ahead-buffer, so no cache line
+        if abs(clock.position - position) >= 0.4 { clock.position = position }
+        if clock.duration != duration { clock.duration = duration }
+        if videoNaturalSize == .zero, let size = vlcEngine?.naturalSize, size != .zero {
+            videoNaturalSize = size
+        }
+        updateSkipIntro()
+        saveProgressThrottled()
+        maybeArmAutoNext()
+    }
+
+    /// Build the audio/subtitle pickers from VLC's track lists.
+    private func loadVLCTracks() {
+        guard let engine = vlcEngine else { return }
+        audioOptions = engine.audioTracks.map {
+            TrackOption(id: "vlc-audio-\($0.id)", displayName: $0.name, payload: .vlcAudio($0.id))
+        }
+        selectedAudioID = "vlc-audio-\(engine.currentAudioID)"
+
+        var subs: [TrackOption] = []
+        if !engine.subtitleTracks.isEmpty {
+            subs.append(TrackOption(id: "sub-off", displayName: "Off", payload: .vlcSubtitle(-1)))
+            subs.append(contentsOf: engine.subtitleTracks
+                .filter { $0.id >= 0 }
+                .map { TrackOption(id: "vlc-sub-\($0.id)", displayName: $0.name, payload: .vlcSubtitle($0.id)) })
+        }
+        subtitleOptions = subs
+        selectedSubtitleID = engine.currentSubtitleID < 0 ? "sub-off" : "vlc-sub-\(engine.currentSubtitleID)"
+        applyDefaultSubtitleIfNeeded()
+    }
+
+    private func loadTracks() {
+        guard let player = playerLayer?.player else { return }
+
+        audioOptions = player.tracks(mediaType: .audio).map { track in
+            TrackOption(
+                id: "audio-\(track.trackID)",
+                displayName: trackLabel(track),
+                payload: .track(track)
+            )
+        }
+        selectedAudioID = player.tracks(mediaType: .audio)
+            .first { $0.isEnabled }
+            .map { "audio-\($0.trackID)" }
+
+        // Preferred audio language: when configured and the stream carries a
+        // matching track, switch to it (highest channel count wins).
+        if !settings.preferredAudioLanguage.isEmpty {
+            let want = settings.preferredAudioLanguage
+            let matches = player.tracks(mediaType: .audio)
+                .filter { ($0.languageCode ?? "").hasPrefix(want) }
+                .sorted { Self.channelCount($0) > Self.channelCount($1) }
+            if let best = matches.first, !best.isEnabled {
+                player.select(track: best)
+                selectedAudioID = "audio-\(best.trackID)"
+            }
+        }
+
+        if let dataSouce = player.subtitleDataSouce {
+            subtitleModel.addSubtitle(dataSouce: dataSouce)
+        }
+        rebuildSubtitleOptions()
+        fetchAddonSubtitles()
+    }
+
+    private func rebuildSubtitleOptions() {
+        var options: [TrackOption] = []
+        let infos = subtitleModel.subtitleInfos
+        if !infos.isEmpty {
+            options.append(TrackOption(id: "sub-off", displayName: "Off", payload: .off))
+            options.append(contentsOf: infos.map { info in
+                TrackOption(
+                    id: "sub-\(info.subtitleID)",
+                    displayName: info.name,
+                    payload: .subtitle(info)
+                )
+            })
+        }
+        subtitleOptions = options
+        if selectedSubtitleID == nil, !options.isEmpty {
+            selectedSubtitleID = "sub-off"
+        }
+        applyDefaultSubtitleIfNeeded()
+    }
+
+    /// True once the "subtitles on by default" auto-selection has fired for
+    /// this stream, so later subtitle waves (addon subs arriving after the
+    /// embedded tracks) don't override a choice — or the user's own change.
+    private var subtitleAutoApplied = false
+
+    /// Turn subtitles on automatically per the user's settings: prefer a track
+    /// in `preferredSubtitleLanguage`, else (only once no more are coming, via
+    /// `allowFallback`) the first available. Subtitles arrive in waves —
+    /// embedded first, addon subs later — so this is called after each wave;
+    /// a preferred-language request waits for a match rather than settling for
+    /// the first track immediately.
+    private func applyDefaultSubtitleIfNeeded(allowFallback: Bool = false) {
+        guard settings.subtitlesOnByDefault, !subtitleAutoApplied else { return }
+        let real = subtitleOptions.filter { $0.id != "sub-off" }
+        guard !real.isEmpty else { return }
+        let want = settings.preferredSubtitleLanguage
+        let chosen: TrackOption?
+        if want.isEmpty {
+            chosen = real.first
+        } else if let match = real.first(where: { optionMatchesLanguage($0, want) }) {
+            chosen = match
+        } else if allowFallback {
+            chosen = real.first
+        } else {
+            chosen = nil   // wait for a later wave that might carry the language
+        }
+        guard let pick = chosen else { return }
+        subtitleAutoApplied = true
+        selectSubtitle(pick)
+    }
+
+    private func optionMatchesLanguage(_ option: TrackOption, _ code: String) -> Bool {
+        let name = option.displayName.lowercased()
+        if let localized = Locale.current.localizedString(forLanguageCode: code)?.lowercased(),
+           name.contains(localized) {
+            return true
+        }
+        return name.contains(code.lowercased())
+    }
+
+    /// Pull external subtitles from any installed subtitle addon (e.g.
+    /// OpenSubtitles) and add them to the picker alongside embedded tracks.
+    private var addonSubtitlesFetched = false
+    private func fetchAddonSubtitles() {
+        guard !addonSubtitlesFetched else { return }
+        let providers = addonManager.subtitleAddons
+        guard !providers.isEmpty else { return }
+        addonSubtitlesFetched = true
+        let id = currentVideo?.id ?? meta.id
+        let type = meta.type
+        Task { [weak self] in
+            guard let self else { return }
+            var added = false
+            for addon in providers {
+                let subs = (try? await StremioAPI.subtitles(addon: addon, type: type, id: id)) ?? []
+                for sub in subs.prefix(25) {
+                    guard let url = URL(string: sub.url) else { continue }
+                    let language = sub.lang.flatMap {
+                        Locale.current.localizedString(forLanguageCode: $0)
+                    } ?? sub.lang ?? "Unknown"
+                    if let engine = self.vlcEngine {
+                        // VLC downloads + renders the sub itself; added without
+                        // auto-selecting so the user picks from the panel.
+                        engine.addExternalSubtitle(url)
+                    } else {
+                        let info = URLSubtitleInfo(
+                            subtitleID: sub.id ?? sub.url,
+                            name: "\(language) · \(addon.manifest.name)",
+                            url: url
+                        )
+                        self.subtitleModel.addSubtitle(info: info)
+                    }
+                    added = true
+                }
+            }
+            guard added else {
+                // No addon subs arrived — this was the last wave, so let a
+                // "subtitles on" preference fall back to the first available.
+                self.applyDefaultSubtitleIfNeeded(allowFallback: true)
+                return
+            }
+            if self.usingVLC {
+                // Give VLC a moment to register the new slave tracks.
+                try? await Task.sleep(nanoseconds: 1_500_000_000)
+                self.loadVLCTracks()
+            } else {
+                self.rebuildSubtitleOptions()
+            }
+            // Addon subs were the final wave: now allow the first-available
+            // fallback if the preferred language still never showed up.
+            self.applyDefaultSubtitleIfNeeded(allowFallback: true)
+        }
+    }
+
+    private func trackLabel(_ track: any MediaPlayerTrack) -> String {
+        var label = track.name
+        if let code = track.languageCode,
+           let language = Locale.current.localizedString(forLanguageCode: code),
+           !label.localizedCaseInsensitiveContains(language) {
+            label += " (\(language))"
+        }
+        return label.isEmpty ? "Track \(track.trackID)" : label
+    }
+
+    // MARK: - Transport
+
+    /// When the player entered pause. Drives the stale-connection recovery on
+    /// resume — after a long pause the debrid CDN has almost certainly dropped
+    /// the idle socket, so a plain play() drains the buffer and then freezes
+    /// mid-scene (the "have to rewind 10 seconds to get it going" bug).
+    private var pausedAt: Date?
+    /// Pause longer than this → resume via an in-place seek. A seek flushes
+    /// the demuxer and re-opens the HTTP connection (range request), which is
+    /// exactly what the manual rewind-10s workaround did. Cheap: the FFmpeg
+    /// restart gate is 3s of buffer.
+    private let staleResumeAfter: TimeInterval = 30
+
+    func togglePlayPause() {
+        // Ignore input while exiting, or during the sub-second post-background
+        // resync (a play press then would race the in-flight flush-seek).
+        guard !isExiting, !isResyncing else { return }
+        if isPlaying {
+            enginePause()
+            if overlay == .none {
+                overlay = .pauseInfo
+            }
+        } else {
+            if let pausedAt, Date().timeIntervalSince(pausedAt) > staleResumeAfter {
+                // Long pause: reconnect in place instead of trusting the idle
+                // socket. Nudge back a second so the seek lands on content
+                // that's certainly still valid keyframe-wise.
+                engineSeek(to: max(position - 1, 0), autoPlay: true)
+            }
+            enginePlay()
+            if overlay == .pauseInfo {
+                overlay = .none
+            }
+            restartHideTimer()
+        }
+    }
+
+    func skip(_ seconds: Double) {
+        seek(to: position + seconds)
+        showToast(TimeFormat.signedDelta(seconds))
+    }
+
+    func seek(to seconds: Double) {
+        let target = max(0, min(seconds, duration > 0 ? duration - 1 : seconds))
+        position = target
+        clock.position = target   // instant UI feedback, no waiting for a tick
+        engineSeek(to: target, autoPlay: true)
+    }
+
+    // MARK: - Infuse-style touchpad scrubbing
+
+    private var scrubAnchor: Double = 0
+    /// Non-published mirror so hot-path logic reads the target without a
+    /// published access; the UI reads `clock.scrubTarget`.
+    private var scrubValue: Double?
+    /// Trackpad pans arrive at 60 Hz — publishing the bar that fast is wasted
+    /// re-render on the A10X. Coalesce to ~30 Hz; the value is exact either way.
+    private var lastScrubPublish = Date.distantPast
+    private func publishScrub(_ value: Double) {
+        scrubValue = value
+        let now = Date()
+        guard now.timeIntervalSince(lastScrubPublish) > 0.033 else { return }
+        lastScrubPublish = now
+        clock.scrubTarget = value
+    }
+
+    // MARK: - Trackpad input (window-level indirect touches: pan + tap)
+    //
+    // Clean, single-source interaction model (rewritten 2026-07-11):
+    //  bare video → tap OR swipe-up = controls, swipe-down = info,
+    //               horizontal drag = scrub.
+    //  scrubbing  → horizontal drag = scrub, tap/click = commit, Menu = cancel,
+    //               press L/R = ±jump, circle = wheel fine-tune.
+    //  controls   → recognizer is OFF; pure focus + move commands.
+
+    /// Last input event, surfaced on-screen when the debug toggle is on so
+    /// gestures can be diagnosed on-device (the sim has no Siri-remote touch).
+    @Published var inputDebug = "—"
+    private func debug(_ s: String) { if settings.showInputDebug { inputDebug = s } }
+    /// Public debug hook for the view's move-command / click paths.
+    func noteInput(_ s: String) { debug(s) }
+
+    /// A trackpad swipe ALSO emits an `.onMoveCommand`; suppress those briefly
+    /// after handling a gesture so they don't double-fire.
+    private var suppressMoveUntil = Date.distantPast
+    var moveSuppressed: Bool { Date() < suppressMoveUntil }
+    private func suppressMoveBriefly() { suppressMoveUntil = Date().addingTimeInterval(0.4) }
+
+    /// Pan translation (points) → seconds for scrub. Proven scale from the app's
+    /// original scrubbing.
+    private var secondsPerPoint: Double {
+        guard duration > 0 else { return 0.5 }
+        return max(duration / 3200, 0.35)
+    }
+
+    private enum TouchIntent { case undecided, scrub, consumed }
+    private var touchIntent: TouchIntent = .undecided
+
+    // Called by RemoteTouchCatcher.
+
+    func remoteTouchBegan() {
+        debug("touch ↓")
+        scrubLastDx = 0            // translation resets per gesture
+        // A pan only BEGINS on real movement (never on a stationary click), so
+        // this reliably means "a swipe is happening" — suppress the parallel
+        // move command the remote emits for the same swipe, so a swipe never
+        // seeks / opens the menu (only a real button CLICK does). It also marks
+        // the in-flight GC touch as a swipe so it isn't also read as a tap.
+        suppressMoveBriefly()
+        noteSwipeStarted()
+        if isScrubbing {
+            touchIntent = .scrub
+        } else {
+            touchIntent = .undecided
+        }
+    }
+
+    /// `dx`/`dy` = pan translation in points from the gesture start.
+    func remoteTouchMoved(dx: CGFloat, dy: CGFloat) {
+        suppressMoveBriefly()      // keep the swipe's move command suppressed
+        switch touchIntent {
+        case .scrub:
+            scrubPanPoints(dx: dx)
+        case .consumed:
+            break
+        case .undecided:
+            let adx = abs(dx), ady = abs(dy)
+            guard max(adx, ady) > 45 else { return }
+            touchIntent = .consumed
+            if ady > adx {
+                if dy > 0 { debug("swipe↓ info"); showInfoPanel() }
+                else { debug("swipe↑ controls"); showControls() }
+            } else {
+                // Horizontal swipe = nothing (no auto-scrub, no seek). Seeking
+                // is a TAP on a side or a directional CLICK.
+                debug("swipe →/←")
+            }
+        }
+    }
+
+    func remoteTouchEnded(dx: CGFloat, dy: CGFloat) {
+        if touchIntent == .scrub { endScrubGesture() }
+        touchIntent = .undecided
+    }
+
+    /// Pan scrub via INCREMENTAL deltas so it composes cleanly with the wheel
+    /// (both just nudge `scrubValue`) and so consecutive drags never jump. Track
+    /// the last translation even while the wheel owns the scrub, so handing back
+    /// to pan doesn't lurch.
+    private var scrubLastDx: CGFloat = 0
+    private func scrubPanPoints(dx: CGFloat) {
+        let inc = dx - scrubLastDx
+        scrubLastDx = dx
+        guard let target = scrubValue, !wheelEngaged else { return }
+        let proposed = target + Double(inc) * secondsPerPoint
+        let clamped = max(0, min(proposed, duration > 0 ? duration - 1 : proposed))
+        publishScrub(clamped)
+        restartScrubTimeout()
+    }
+
+    func beginScrub() {
+        guard hasStartedPlayback else { return }
+        guard overlay == .none || overlay == .controls || overlay == .pauseInfo else { return }
+        overlay = .none
+        hidePeek()
+        scrubAnchor = position
+        scrubValue = position
+        clock.scrubTarget = position
+        isScrubbing = true
+        resetWheel()
+        restartScrubTimeout()
+    }
+
+    /// Re-anchor between pan gestures so consecutive swipes accumulate, and
+    /// flush the exact value to the bar (the 30 Hz throttle may have dropped
+    /// the final delta, leaving the bar a frame behind where the finger left).
+    func endScrubGesture() {
+        if let target = scrubValue {
+            scrubAnchor = target
+            clock.scrubTarget = target
+        }
+    }
+
+    func commitScrub() {
+        guard let target = scrubValue else { return }
+        seek(to: target)
+        clock.scrubTarget = nil
+        scrubValue = nil
+        isScrubbing = false
+        resetWheel()
+        scrubTimeoutTask?.cancel()
+        // Leave the bar up briefly so you see where you landed, Netflix-style.
+        showControls()
+    }
+
+    func cancelScrub() {
+        clock.scrubTarget = nil
+        scrubValue = nil
+        isScrubbing = false
+        resetWheel()
+        scrubTimeoutTask?.cancel()
+    }
+
+    /// Coarse jump while in scrub mode: a left/right press moves the target by
+    /// the configured scrubber-jump amount (default a minute) — pan zooms,
+    /// presses hop, the wheel fine-tunes.
+    func scrubJump(_ seconds: Double) {
+        guard isScrubbing, let target = scrubValue else { return }
+        let proposed = target + seconds
+        let clamped = max(0, min(proposed, duration > 0 ? duration - 1 : proposed))
+        publishScrub(clamped)
+        restartScrubTimeout()
+    }
+
+    // MARK: - Edge wheel fine-tune (Infuse-style: hold at the side & circle)
+
+    /// True while the finger is held at the trackpad EDGE — fine-tune mode.
+    /// Engaging at the edge (not on any arc) is what stops the wheel from
+    /// hijacking a normal horizontal scrub, and it drives the on-screen
+    /// fine-tune indicator.
+    @Published private(set) var wheelEngaged = false
+    private var wheelLastAngle: Double?
+    /// One full revolution ≈ this many seconds — small, because it's FINE tuning.
+    private let wheelSecondsPerRevolution: Double = 24
+
+    /// GameController absolute finger position ((0,0) = not touching).
+    private func wheelSample(x: Double, y: Double) {
+        guard isScrubbing else { resetWheel(); return }
+        let radius = (x * x + y * y).squareRoot()
+
+        // Finger lifted → leave fine-tune; normal pan owns the scrub again.
+        if radius < 0.1 {
+            wheelEngaged = false
+            wheelLastAngle = nil
+            return
+        }
+        // ENGAGE only by reaching the EDGE. But once engaged, the WHOLE pad is
+        // the wheel — you can circle anywhere and it keeps turning; it only ends
+        // on lift. (Requested: "have the whole trackpad be for fine tuning".)
+        if !wheelEngaged {
+            guard radius > 0.72 else { return }   // not at edge yet → pan handles it
+            wheelEngaged = true
+            wheelLastAngle = nil
+        }
+        // Near dead-center atan2 is noisy and flips direction — pause the angle
+        // there (don't jump) but STAY engaged; re-anchor when it recovers.
+        guard radius > 0.22 else { wheelLastAngle = nil; return }
+
+        let angle = atan2(y, x)
+        defer { wheelLastAngle = angle; clock.wheelAngle = angle }
+        guard let last = wheelLastAngle, let target = scrubValue else { return }
+        var delta = angle - last
+        if delta > .pi { delta -= 2 * .pi }
+        if delta < -.pi { delta += 2 * .pi }
+        guard abs(delta) < 1.0 else { return }   // sample glitch, ignore
+        // Clockwise = forward (screen coords: clockwise decreases atan2 angle).
+        let seconds = -delta / (2 * .pi) * wheelSecondsPerRevolution
+        let proposed = target + seconds
+        let clamped = max(0, min(proposed, duration > 0 ? duration - 1 : proposed))
+        publishScrub(clamped)
+        restartScrubTimeout()
+    }
+
+    private func resetWheel() {
+        wheelLastAngle = nil
+        wheelEngaged = false
+    }
+
+    // MARK: - Circular wheel (GameController absolute position, scrub-only)
+
+    // GameController drives the fine-tune wheel (while scrubbing) AND light-tap
+    // detection (otherwise) — the pan recognizer can't see a touch-only tap, but
+    // this absolute-position stream does fire (it's what the wheel uses).
+    private var gcTouchDown = false
+    private var gcTouchStartTime = Date()
+    /// True if the pan recognizer began (i.e. a real SWIPE) during this touch —
+    /// that's what makes it NOT a tap. Distance is unreliable for side taps
+    /// (the finger lands off-center and the lift trajectory adds travel), so we
+    /// use "did the pan fire?" instead.
+    private var gcPanFiredThisTouch = false
+
+    /// Called by the pan recognizer's .began (movement-gated). Marks the
+    /// in-flight GC touch as a swipe so it isn't also treated as a tap.
+    func noteSwipeStarted() { gcPanFiredThisTouch = true }
+
+    private func dpadSample(x: Double, y: Double) {
+        if isScrubbing { wheelSample(x: x, y: y); return }
+
+        let touching = abs(x) > 0.001 || abs(y) > 0.001
+        if touching {
+            if !gcTouchDown {
+                gcTouchDown = true
+                gcTouchStartTime = Date()
+                gcPanFiredThisTouch = false
+                debug("gc↓")
+            }
+        } else if gcTouchDown {
+            gcTouchDown = false
+            let dur = Date().timeIntervalSince(gcTouchStartTime)
+            debug("gc↑ \(Int(dur * 1000))ms\(gcPanFiredThisTouch ? " swipe" : "")")
+            // A tap = brief contact with NO pan (no swipe) — works anywhere on
+            // the pad, including the far edges.
+            if dur < 0.6, !gcPanFiredThisTouch { remoteTapped() }
+        }
+    }
+
+    /// Light tap (no click, no swipe) → SHOW the peek bar. A tap only ever
+    /// shows: nothing hides the peek/menu/scrub except the auto-timer and Back.
+    private func remoteTapped() {
+        debug("tap:show")
+        guard hasStartedPlayback, !isScrubbing, overlay == .none else { return }
+        showPeek()
+    }
+
+    // MARK: - Peek bar (light tap → just the timeline, no menu)
+
+    @Published private(set) var peekVisible = false
+    private var peekTask: Task<Void, Never>?
+
+    func showPeek() {
+        guard hasStartedPlayback, overlay == .none, !isScrubbing else { return }
+        peekVisible = true
+        peekTask?.cancel()
+        peekTask = Task { [weak self] in
+            try? await Task.sleep(nanoseconds: 4_000_000_000)
+            guard !Task.isCancelled else { return }
+            self?.peekVisible = false
+        }
+    }
+
+    func hidePeek() {
+        peekTask?.cancel()
+        peekVisible = false
+    }
+
+    func configureWheelTracking() {
+        for controller in GCController.controllers() {
+            guard let pad = controller.microGamepad else { continue }
+            pad.reportsAbsoluteDpadValues = true
+            pad.dpad.valueChangedHandler = { [weak self] _, x, y in
+                MainActor.assumeIsolated { self?.dpadSample(x: Double(x), y: Double(y)) }
+            }
+        }
+    }
+
+    private func restartScrubTimeout() {
+        scrubTimeoutTask?.cancel()
+        scrubTimeoutTask = Task { [weak self] in
+            try? await Task.sleep(nanoseconds: 6_000_000_000)
+            guard !Task.isCancelled else { return }
+            self?.cancelScrub()
+        }
+    }
+
+    // MARK: - D-pad seeking (press-to-skip, accumulating, with hold-accel)
+
+    private var lastNudgeAt: Date?
+    private var nudgeStreak = 0
+
+    /// One left/right press. `base` is the configured skip amount (signed).
+    /// Rapid consecutive presses accumulate into one bigger seek and, because
+    /// holding the D-pad repeats the command, holding accelerates (each quick
+    /// repeat grows the step) — a smooth "zoom" forward/back. Commits after a
+    /// short pause so the seek fires once, not on every tap.
+    func nudgeSeek(_ base: Double) {
+        guard hasStartedPlayback else { return }
+        let now = Date()
+        if let last = lastNudgeAt, now.timeIntervalSince(last) < 0.35 {
+            nudgeStreak = min(nudgeStreak + 1, 12)
+        } else {
+            nudgeStreak = 0
+        }
+        lastNudgeAt = now
+
+        // 1× on a lone press; ramps up while the button is held.
+        let accel = 1.0 + Double(nudgeStreak) * 0.6
+        pendingSeekDelta += base * accel
+
+        // Clamp the running preview to the timeline.
+        if duration > 0 {
+            let target = min(max(position + pendingSeekDelta, 0), duration - 1)
+            pendingSeekDelta = target - position
+        }
+
+        restartHideTimer()
+        seekDebounceTask?.cancel()
+        seekDebounceTask = Task { [weak self] in
+            try? await Task.sleep(nanoseconds: 650_000_000)
+            guard !Task.isCancelled, let self else { return }
+            let delta = pendingSeekDelta
+            pendingSeekDelta = 0
+            nudgeStreak = 0
+            guard delta != 0 else { return }
+            seek(to: position + delta)
+        }
+    }
+
+    // MARK: - Controls visibility
+
+    func showControls() {
+        // No chrome over the loading screen — gestures wake the UI only once
+        // the movie is actually playing.
+        guard hasStartedPlayback else { return }
+        overlay = .controls
+        restartHideTimer()
+    }
+
+    func hideControls() {
+        if overlay == .controls { overlay = .none }
+    }
+
+    func restartHideTimer() {
+        hideControlsTask?.cancel()
+        hideControlsTask = Task { [weak self] in
+            // 3s of true idle — every remote interaction (focus moves included)
+            // restarts this, so the controls never vanish mid-navigation.
+            try? await Task.sleep(nanoseconds: 3_000_000_000)
+            guard !Task.isCancelled, let self else { return }
+            if overlay == .controls, isPlaying {
+                overlay = .none
+            }
+        }
+    }
+
+    /// Menu/Back button handling. Back NEVER leaves playback directly — it
+    /// either steps back out of a sub-panel to the main player controls, or (at
+    /// the top level) raises the "Exit Player?" confirmation. Always returns
+    /// true: the actual exit only happens when the user confirms it from the
+    /// `.exitConfirm` overlay. `handleExit` is therefore fully self-contained.
+    /// One Menu press can be delivered by BOTH the window-level catcher and a
+    /// SwiftUI onExitCommand — dedupe so it only steps back once.
+    private var lastExitPressAt = Date.distantPast
+
+    func handleExit() -> Bool {
+        // Exit already in flight: swallow every Back press so it can't
+        // re-open overlays / restart playback while the display-mode switch
+        // and dismissal complete.
+        guard !isExiting else { return true }
+        let now = Date()
+        guard now.timeIntervalSince(lastExitPressAt) > 0.3 else { return true }
+        lastExitPressAt = now
+        if isScrubbing {
+            cancelScrub()
+            return true
+        }
+        // Peek bar up → Back just hides the bar (don't prompt to exit).
+        if peekVisible {
+            hidePeek()
+            return true
+        }
+        switch overlay {
+        case .episodes, .sources, .audio, .subtitles, .speed, .engine:
+            // A player sub-menu → step back to the main player controls.
+            overlay = .controls
+            restartHideTimer()
+        case .pauseInfo:
+            // Back out to paused video *with* controls so the user is never
+            // left staring at a frozen frame with no visible UI.
+            overlay = .controls
+        case .upNext:
+            // Back on Up Next hides the card and keeps playing the current ep.
+            dismissUpNext()
+        case .controls:
+            // Back with the controls showing just hides them (Netflix/Hulu) —
+            // the exit prompt only appears from the bare video. The player
+            // auto-shows controls when a stream first loads, so confirming here
+            // would pop "Exit Player?" the instant playback begins.
+            overlay = .none
+        case .exitConfirm:
+            // Back while the confirmation is up dismisses it and keeps playing.
+            cancelExitConfirm()
+        case .info:
+            // Back closes the pull-down and returns to the bare video.
+            dismissInfoPanel()
+        case .none, .error, .stillWatching, .postPlay:
+            // Bare video / dead-end overlays → ask before leaving.
+            requestExitConfirm()
+        }
+        return true
+    }
+
+    /// Raise the "Exit Player?" confirmation. Progress is persisted up front so
+    /// it's safe even if the user then powers off instead of confirming.
+    func requestExitConfirm() {
+        saveProgress()
+        hideControlsTask?.cancel()
+        overlay = .exitConfirm
+    }
+
+    /// Dismiss the exit confirmation and return to the main player controls.
+    func cancelExitConfirm() {
+        guard hasStartedPlayback else {
+            overlay = .none
+            return
+        }
+        overlay = .controls
+        restartHideTimer()
+    }
+
+    // MARK: - Tracks / speed / aspect
+
+    func selectAudio(_ track: TrackOption) {
+        selectedAudioID = track.id
+        switch track.payload {
+        case .track(let mediaTrack):
+            playerLayer?.player.select(track: mediaTrack)
+        case .vlcAudio(let id):
+            vlcEngine?.selectAudio(id)
+        default:
+            break
+        }
+    }
+
+    func selectSubtitle(_ track: TrackOption) {
+        selectedSubtitleID = track.id
+        switch track.payload {
+        case .subtitle(let info):
+            // Addon subtitles are downloaded + parsed on selection, which can
+            // take a few seconds — say so instead of appearing dead.
+            if info as? URLSubtitleInfo != nil {
+                showToast("Loading subtitles…")
+            }
+            subtitleModel.selectedSubtitleInfo = info
+        case .vlcSubtitle(let id):
+            // VLC renders its own subtitles; -1 disables them.
+            vlcEngine?.selectSubtitle(id)
+        default:
+            subtitleModel.selectedSubtitleInfo = nil
+        }
+    }
+
+    func setSpeed(_ speed: Float) {
+        playbackSpeed = speed
+        if let vlcEngine { vlcEngine.rate = speed }
+        else { playerLayer?.player.playbackRate = speed }
+        showToast("Speed \(speed == 1 ? "Normal" : String(format: "%gx", speed))")
+    }
+
+    func cycleAspect() {
+        let all = AspectMode.allCases
+        let next = all[(all.firstIndex(of: aspectMode)! + 1) % all.count]
+        aspectMode = next
+        // The visual change is a SwiftUI transform on the video host (see
+        // AspectMode.scale) — the engine stays pinned to aspect-fit. On video
+        // that already matches the screen's shape, zoom/stretch are identical
+        // to fit — say so instead of looking broken.
+        let tv = CGSize(width: 1920, height: 1080)
+        let scale = next.scale(video: videoNaturalSize, container: tv)
+        if next != .fit, videoNaturalSize != .zero,
+           abs(scale.width - 1) < 0.01, abs(scale.height - 1) < 0.01 {
+            showToast("\(next.label) — video already fills the screen")
+        } else {
+            showToast(next.label)
+        }
+    }
+
+    /// Decoded video dimensions, published for the aspect-mode transform.
+    @Published private(set) var videoNaturalSize: CGSize = .zero
+
+    // MARK: - Chapters / skip intro
+
+    /// Container chapters (FFmpeg engine; MKVs usually carry them).
+    @Published private(set) var chapters: [Chapter] = []
+    /// True while playback sits inside an intro-like chapter — the player
+    /// shows a "Skip Intro" pill and Play/Pause skips it.
+    @Published private(set) var skipIntroActive = false
+
+    /// A chapter that reads like an intro/opening/recap.
+    private var introChapter: Chapter? {
+        chapters.first { chapter in
+            let title = chapter.title.lowercased()
+            return title.contains("intro") || title.contains("opening")
+                || title.contains("recap") || title.contains("prologue")
+        }
+    }
+
+    /// Chapter starts as 0…1 fractions for timeline tick marks.
+    var chapterFractions: [Double] {
+        guard duration > 0, chapters.count > 1 else { return [] }
+        return chapters.map { $0.start / duration }.filter { $0 > 0.01 && $0 < 0.99 }
+    }
+
+    private func updateSkipIntro() {
+        guard let intro = introChapter else {
+            if skipIntroActive { skipIntroActive = false }
+            return
+        }
+        let active = position >= intro.start && position < intro.end - 2
+        if active != skipIntroActive { skipIntroActive = active }
+    }
+
+    /// Jump past the intro chapter.
+    func skipIntro() {
+        guard let intro = introChapter else { return }
+        seek(to: intro.end)
+        skipIntroActive = false
+        showToast("Skipped intro")
+    }
+
+    private func showToast(_ text: String) {
+        toast = text
+        toastTask?.cancel()
+        toastTask = Task { [weak self] in
+            try? await Task.sleep(nanoseconds: 1_600_000_000)
+            guard !Task.isCancelled else { return }
+            self?.toast = nil
+        }
+    }
+
+    // MARK: - Source switching & episodes
+
+    /// True while the Sources panel is fetching alternatives in the background.
+    @Published private(set) var isLoadingSources = false
+
+    /// Resolves a torrent stream to a direct URL through the configured debrid
+    /// provider. Injected by PlayerScreen (which owns the DebridStore); nil
+    /// when no provider is configured.
+    var torrentResolver: ((Stream) async -> Stream?)?
+
+    // MARK: - In-player engine switching
+
+    /// Session override picked from the in-player Engine panel; falls back to
+    /// the Settings choice.
+    @Published private(set) var sessionEngine: PlayerEngine?
+    var effectiveEngine: PlayerEngine { sessionEngine ?? settings.playerEngine }
+
+    /// Reload the current stream through a different engine, keeping position.
+    func switchEngine(_ engine: PlayerEngine) {
+        guard engine != effectiveEngine else {
+            overlay = .none
+            return
+        }
+        sessionEngine = engine
+        overlay = .none
+        let resumeAt = position
+        countdownTask?.cancel()
+        upNextCountdown = nil
+        pendingResume = resumeAt > 10 ? resumeAt : nil
+        showToast("Engine: \(engine.label)")
+        load(entry: currentEntry)
+    }
+
+    /// Fetch every stream for the current title from the installed stream
+    /// addons. Torrent entries are kept only when a debrid resolver exists.
+    private func fetchAvailableSources() async -> [StreamEntry] {
+        let id = currentVideo?.id ?? meta.id
+        let type = meta.type
+        let hasResolver = torrentResolver != nil
+        var entries: [StreamEntry] = []
+        // Instant path: the Sources page caches the raw source list per title,
+        // so an in-player Sources open / failover re-uses it with no sweep.
+        if let cached = await StreamsViewModel.sourceCache.value(for: id, ttl: StreamsViewModel.sourceCacheTTL),
+           !cached.isEmpty {
+            entries = cached
+                .map { StreamEntry(addonName: $0.addonName, stream: $0.stream) }
+                .filter { $0.stream.isPlayable || (hasResolver && $0.stream.isTorrent) }
+        } else {
+            let addons = addonManager.streamAddons.filter { $0.handles(id: id) }
+            await withTaskGroup(of: [StreamEntry].self) { group in
+                for addon in addons {
+                    group.addTask {
+                        let streams = (try? await StremioAPI.streams(addon: addon, type: type, id: id)) ?? []
+                        return streams
+                            .filter { $0.isPlayable || (hasResolver && $0.isTorrent) }
+                            .map { StreamEntry(addonName: addon.manifest.name, stream: $0) }
+                    }
+                }
+                for await batch in group { entries.append(contentsOf: batch) }
+            }
+            // Persist for instant re-open (mirrors the Sources page).
+            let snapshot = entries.map { CachedStreamSource(addonName: $0.addonName, stream: $0.stream) }
+            if !snapshot.isEmpty {
+                await StreamsViewModel.sourceCache.store(snapshot, for: id)
+            }
+        }
+        // Curate into size tiers with cached links first (same rule as the
+        // Sources page) so the panel is a short, useful list instead of every
+        // link an addon returned. Filters off → raw addon order (cached still
+        // first), capped per addon.
+        guard settings.sourceFiltersEnabled else {
+            return SourceSelection.selectUnfiltered(
+                entries, cap: PlayerSettings.unfilteredPerAddonCap
+            )
+        }
+        return SourceSelection.select(entries, perBucket: settings.sourcesPerSizeTier)
+    }
+
+    /// Playback started from Continue Watching carries `allEntries: []` (only
+    /// the remembered stream URL). Opening the Sources panel then showed an
+    /// empty list — and with zero focusable rows, Menu fell through and closed
+    /// the whole player. Fetch the alternatives on demand.
+    func loadSourcesIfNeeded() {
+        guard allEntries.count <= 1, !isLoadingSources else { return }
+        isLoadingSources = true
+        Task { [weak self] in
+            guard let self else { return }
+            defer { self.isLoadingSources = false }
+            var entries = await self.fetchAvailableSources()
+            // Keep the playing stream selectable/at the top when the fetch
+            // didn't return it (e.g. an expired debrid link).
+            if !entries.contains(where: { $0.stream.url == self.currentEntry.stream.url }) {
+                entries.insert(self.currentEntry, at: 0)
+            }
+            self.allEntries = entries
+        }
+    }
+
+    // MARK: - Load timeout watchdog
+
+    /// True once the current load has actually opened/started playing, so the
+    /// watchdog knows the source is alive.
+    private var currentLoadStarted = false
+    private var loadWatchdogTask: Task<Void, Never>?
+    /// A source that hasn't started playing within this long is treated as
+    /// dead and swapped for another of the same quality. Generous, because a
+    /// slow debrid link legitimately takes 10–20s to open a big remux.
+    private let loadTimeoutSeconds: UInt64 = 30
+
+    /// (Re)arm the watchdog for a fresh load. Called from `load`/`loadViaVLC`.
+    private func startLoadWatchdog() {
+        currentLoadStarted = false
+        loadWatchdogTask?.cancel()
+        let targetURL = currentURL
+        let timeout = loadTimeoutSeconds
+        loadWatchdogTask = Task { [weak self] in
+            try? await Task.sleep(nanoseconds: timeout * 1_000_000_000)
+            guard !Task.isCancelled, let self,
+                  !self.currentLoadStarted, !self.isExiting, !self.isFailingOver,
+                  // Only if we're still on the same load that armed this.
+                  self.currentURL == targetURL
+            else { return }
+            self.showToast("Source didn't load — trying another")
+            self.attemptFailover(
+                afterError: NSError(
+                    domain: "Nuvio", code: -2,
+                    userInfo: [NSLocalizedDescriptionKey: "The source didn't start within \(self.loadTimeoutSeconds) seconds."]
+                ),
+                preferResolution: self.currentEntry.resolutionLabel
+            )
+        }
+    }
+
+    /// Playback has demonstrably begun for the current load — disarm the
+    /// watchdog. Idempotent.
+    private func markLoadStarted() {
+        guard !currentLoadStarted else { return }
+        currentLoadStarted = true
+        loadWatchdogTask?.cancel()
+        loadWatchdogTask = nil
+    }
+
+    // MARK: - Automatic source failover
+
+    /// Sources already tried (and failed) this session, so the failover never
+    /// loops back onto a dead link.
+    private var failedSourceIDs: Set<UUID> = []
+    private var isFailingOver = false
+
+    /// A stream died. Remember the survivors' position, pick the next viable
+    /// source, and switch to it silently — the error overlay only appears when
+    /// every candidate is exhausted. `preferResolution` floats sources of the
+    /// same quality to the front (used by the load-timeout failover, so a slow
+    /// 4K link is replaced by another 4K link, not a random 480p one).
+    private func attemptFailover(afterError error: Error, preferResolution: String? = nil) {
+        guard !isFailingOver else { return }
+        isFailingOver = true
+        failedSourceIDs.insert(currentEntry.id)
+        let resumeAt = max(position, pendingResume ?? 0)
+        isSwitchingSource = true
+        Task { [weak self] in
+            guard let self else { return }
+            defer {
+                self.isFailingOver = false
+                self.isSwitchingSource = false
+            }
+            // A bare Continue Watching session has no alternatives yet (and an
+            // expired debrid link NEEDS a re-resolve) — fetch the list first.
+            if self.allEntries.count <= 1 {
+                self.allEntries = await self.fetchAvailableSources()
+            }
+            var candidates = self.allEntries.filter { entry in
+                !self.failedSourceIDs.contains(entry.id)
+                    && entry.stream.url != self.currentEntry.stream.url
+            }
+            // Same-quality first (stable, so cached-first order survives within
+            // each half) when a preferred resolution was given.
+            if let preferResolution {
+                candidates = candidates.filter { $0.resolutionLabel == preferResolution }
+                    + candidates.filter { $0.resolutionLabel != preferResolution }
+            }
+            guard var next = candidates.first else {
+                self.overlay = .error(
+                    "Playback failed: \(error.localizedDescription)\n\nEvery available source "
+                    + "was tried — they may be offline or region-blocked."
+                )
+                return
+            }
+            // Torrent candidate → resolve to a direct link first.
+            if next.stream.isTorrent {
+                guard let resolver = self.torrentResolver,
+                      let resolved = await resolver(next.stream) else {
+                    self.failedSourceIDs.insert(next.id)
+                    self.attemptFailoverRetry(afterError: error)
+                    return
+                }
+                next = StreamEntry(addonName: next.addonName, stream: resolved)
+            }
+            self.showToast("Source failed — trying \(next.addonName)")
+            self.currentEntry = next
+            self.pendingResume = resumeAt > 10 ? resumeAt : nil
+            self.load(entry: next)
+        }
+    }
+
+    /// Re-enter the failover after a candidate was consumed without a load.
+    private func attemptFailoverRetry(afterError error: Error) {
+        isFailingOver = false
+        attemptFailover(afterError: error)
+    }
+
+    func switchSource(_ entry: StreamEntry) {
+        guard entry.id != currentEntry.id else {
+            overlay = .none
+            return
+        }
+        // Torrent source mid-playback: resolve through debrid first (this
+        // previously dead-ended with "no playable link").
+        if entry.stream.isTorrent {
+            guard let resolver = torrentResolver else {
+                showToast("Add a debrid key in Settings to play torrent sources")
+                return
+            }
+            overlay = .none
+            isSwitchingSource = true
+            let resumeAt = position
+            Task { [weak self] in
+                guard let self else { return }
+                defer { self.isSwitchingSource = false }
+                guard let resolved = await resolver(entry.stream) else {
+                    self.showToast("Couldn't resolve this source — try another")
+                    return
+                }
+                let direct = StreamEntry(addonName: entry.addonName, stream: resolved)
+                self.currentEntry = direct
+                self.countdownTask?.cancel()
+                self.upNextCountdown = nil
+                self.pendingResume = resumeAt > 10 ? resumeAt : nil
+                self.load(entry: direct)
+            }
+            return
+        }
+        let resumeAt = position
+        currentEntry = entry
+        overlay = .none
+        // Same episode, new source — keep the auto-next arming state as-is
+        // (position resumes), but drop any pending Up Next for the old stream.
+        countdownTask?.cancel()
+        upNextCountdown = nil
+        pendingResume = resumeAt > 10 ? resumeAt : nil
+        load(entry: entry)
+    }
+
+    var nextEpisode: MetaVideo? {
+        // displayMeta: CW-resumed sessions only get their episode list from
+        // the enriched fetch — without it auto-next never fired for them.
+        guard let current = currentVideo, let videos = displayMeta.videos else { return nil }
+        let ordered = videos
+            .filter { ($0.season ?? 0) > 0 }
+            .sorted {
+                ($0.season ?? 0, $0.episode ?? 0) < ($1.season ?? 0, $1.episode ?? 0)
+            }
+        guard let index = ordered.firstIndex(where: { $0.id == current.id }) else { return nil }
+        let next = ordered.dropFirst(index + 1).first
+        return next?.hasAired == true ? next : nil
+    }
+
+    // MARK: - Post-play / auto-next
+
+    /// Whether the current position has crossed the configured next-episode
+    /// threshold (percentage of runtime, or minutes-before-end).
+    private func crossedNextEpisodeThreshold() -> Bool {
+        guard duration > 0 else { return false }
+        switch settings.nextEpisodeThresholdMode {
+        case .percentage:
+            return position >= duration * (settings.nextEpisodeThresholdPercent / 100)
+        case .minutesBeforeEnd:
+            return (duration - position) <= settings.nextEpisodeThresholdMinutesBeforeEnd * 60
+        }
+    }
+
+    /// Called on each time tick. Arms the Up Next overlay once the threshold is
+    /// crossed and a next episode exists (only when auto-play-next is enabled).
+    private func maybeArmAutoNext() {
+        guard settings.autoPlayNextEpisode, !autoAdvanceArmed,
+              let next = nextEpisode, crossedNextEpisodeThreshold() else { return }
+        autoAdvanceArmed = true
+        armUpNext(episode: next, atEnd: false)
+    }
+
+    /// Show the Up Next card and, unless the timeout is "unlimited", start the
+    /// countdown that auto-advances. Doesn't interrupt an interactive overlay
+    /// the user has opened (episodes/sources/etc).
+    private func armUpNext(episode: MetaVideo, atEnd: Bool) {
+        upNextEpisode = episode
+        // Don't yank focus from a menu the user is actively using; the end-of-
+        // content path (atEnd) always shows it since playback has stopped.
+        let interactive: [PlayerOverlay] = [.episodes, .sources, .audio, .subtitles, .speed]
+        if !atEnd && interactive.contains(overlay) { return }
+        overlay = .upNext
+
+        let timeout = settings.autoPlayTimeoutSeconds
+        guard timeout != PlayerSettings.timeoutUnlimited else {
+            upNextCountdown = nil   // wait for the user to confirm
+            return
+        }
+        startUpNextCountdown(from: timeout)
+    }
+
+    private func startUpNextCountdown(from seconds: Int) {
+        countdownTask?.cancel()
+        upNextTotalSeconds = max(seconds, 1)
+        upNextCountdown = seconds
+        countdownTask = Task { [weak self] in
+            var remaining = seconds
+            while remaining > 0 {
+                try? await Task.sleep(nanoseconds: 1_000_000_000)
+                guard !Task.isCancelled, let self else { return }
+                remaining -= 1
+                self.upNextCountdown = remaining
+            }
+            guard !Task.isCancelled, let self else { return }
+            self.advanceToNext(userInitiated: false)
+        }
+    }
+
+    /// Advance to the queued Up Next episode. Honors the Still Watching gate:
+    /// after `stillWatchingEpisodeThreshold` consecutive auto-advances it shows
+    /// the gate instead of playing, until the user confirms.
+    private func advanceToNext(userInitiated: Bool) {
+        countdownTask?.cancel()
+        upNextCountdown = nil
+        guard let episode = upNextEpisode else { return }
+
+        if !userInitiated, settings.stillWatchingEnabled,
+           consecutiveAutoAdvances + 1 >= settings.stillWatchingEpisodeThreshold {
+            playerLayer?.pause()
+            overlay = .stillWatching
+            return
+        }
+        consecutiveAutoAdvances = userInitiated ? 0 : consecutiveAutoAdvances + 1
+        play(episode: episode, autoAdvance: !userInitiated)
+    }
+
+    /// User pressed "Play Next Episode" on the Up Next card.
+    func playUpNextNow() {
+        advanceToNext(userInitiated: true)
+    }
+
+    /// Long-press "Select Source" on the Up Next card — advance to the next
+    /// episode but open its Sources panel to pick a link.
+    func playUpNextChoosingSource() {
+        countdownTask?.cancel()
+        upNextCountdown = nil
+        guard let episode = upNextEpisode else { return }
+        consecutiveAutoAdvances = 0
+        play(episode: episode, presentSources: true)
+    }
+
+    /// Long-press "Mark Next Watched" on the Up Next card.
+    func markUpNextWatched() {
+        guard let episode = upNextEpisode else { return }
+        markEpisodeWatched(episode)
+    }
+
+    /// User dismissed the Up Next card — keep playing the current episode and
+    /// don't re-arm for it. At the end of content this closes to controls.
+    func dismissUpNext() {
+        countdownTask?.cancel()
+        upNextCountdown = nil
+        upNextEpisode = nil
+        overlay = isPlaying ? .none : .controls
+    }
+
+    /// "I'm still here" — reset the counter and continue into the next episode.
+    func confirmStillWatching() {
+        consecutiveAutoAdvances = 0
+        guard let episode = upNextEpisode else {
+            overlay = .none
+            return
+        }
+        play(episode: episode, autoAdvance: false)
+    }
+
+    /// Replay the finished title from the start (post-play overlay).
+    func replay() {
+        overlay = .none
+        upNextEpisode = nil
+        autoAdvanceArmed = false
+        consecutiveAutoAdvances = 0
+        seek(to: 0)
+        playerLayer?.play()
+    }
+
+    /// End-of-content handling: queue the next episode (auto-play), or show the
+    /// post-play overlay for movies / last episodes.
+    private func handlePlayedToEnd() {
+        saveProgress()
+        if settings.autoPlayNextEpisode, let next = nextEpisode {
+            autoAdvanceArmed = true
+            armUpNext(episode: next, atEnd: true)
+        } else {
+            overlay = .postPlay
+        }
+    }
+
+    /// Play a specific episode. `presentSources` opens the Sources panel once
+    /// the episode's links are loaded (the "Choose Source" long-press action),
+    /// so the viewer can pick a link instead of taking the auto-selected one.
+    func play(episode: MetaVideo, autoAdvance: Bool = false, presentSources: Bool = false) {
+        overlay = .none
+        countdownTask?.cancel()
+        upNextCountdown = nil
+        upNextEpisode = nil
+        autoAdvanceArmed = false
+        if !autoAdvance { consecutiveAutoAdvances = 0 }
+        isSwitchingSource = true
+        saveProgress()
+        playerLayer?.pause()
+        let hasResolver = torrentResolver != nil
+        Task {
+            defer { isSwitchingSource = false }
+            let addons = addonManager.streamAddons.filter { $0.handles(id: episode.id) }
+            var entries: [StreamEntry] = []
+            await withTaskGroup(of: [StreamEntry].self) { group in
+                for addon in addons {
+                    group.addTask { [meta] in
+                        let streams = (try? await StremioAPI.streams(addon: addon, type: meta.type, id: episode.id)) ?? []
+                        // Keep cached torrents too when a debrid resolver
+                        // exists, so the Choose-Source list isn't just direct
+                        // links.
+                        return streams
+                            .filter { $0.isPlayable || (hasResolver && $0.isTorrent) }
+                            .map { StreamEntry(addonName: addon.manifest.name, stream: $0) }
+                    }
+                }
+                for await batch in group {
+                    entries.append(contentsOf: batch)
+                }
+            }
+            guard !entries.isEmpty else {
+                overlay = .error("No playable sources found for \(episode.seasonEpisodeCode).")
+                return
+            }
+            // Curate the panel list (size tiers, cached first) like the Sources
+            // page; fall back to the raw list if curation drops everything.
+            let curated = settings.sourceFiltersEnabled
+                ? SourceSelection.select(entries, perBucket: settings.sourcesPerSizeTier)
+                : SourceSelection.selectUnfiltered(entries, cap: PlayerSettings.unfilteredPerAddonCap)
+            let panelEntries = curated.isEmpty ? entries : curated
+
+            // Auto-pick must be directly playable (load() can't resolve a
+            // torrent). Prefer the same addon/binge group as the current one.
+            let playable = panelEntries.filter(\.stream.isPlayable)
+            let preferred = playable.first {
+                $0.addonName == currentEntry.addonName &&
+                $0.stream.behaviorHints?.bingeGroup != nil &&
+                $0.stream.behaviorHints?.bingeGroup == currentEntry.stream.behaviorHints?.bingeGroup
+            } ?? playable.first { $0.addonName == currentEntry.addonName } ?? playable.first
+
+            currentVideo = episode
+            allEntries = panelEntries
+            pendingResume = progressStore.progress(for: episode.id)?.positionSeconds
+
+            if let preferred, !presentSources {
+                currentEntry = preferred
+                load(entry: preferred)
+            } else if let preferred {
+                // Choose Source: start the auto-pick playing, then open the
+                // panel so the viewer can switch.
+                currentEntry = preferred
+                load(entry: preferred)
+                overlay = .sources
+            } else {
+                // Only torrents available (no direct link to auto-load) — go
+                // straight to the picker so the user resolves one.
+                if let first = panelEntries.first { currentEntry = first }
+                overlay = .sources
+            }
+        }
+    }
+
+    /// Mark an episode watched (wired to WatchedStore by PlayerScreen).
+    var markWatched: ((MetaVideo) -> Void)?
+    func markEpisodeWatched(_ episode: MetaVideo) {
+        markWatched?(episode)
+        showToast("Marked \(episode.seasonEpisodeCode) as watched")
+    }
+
+    // MARK: - Progress persistence
+
+    private func saveProgressThrottled() {
+        // Periodic saves are TRANSIENT: persisted to disk for crash safety,
+        // but never published — a publish re-renders the whole Home screen
+        // behind the player, which was the periodic playback hiccup. The
+        // exit/teardown paths call saveProgress(), which publishes once.
+        guard Date().timeIntervalSince(lastProgressSave) > 30 else { return }
+        lastProgressSave = Date()
+        progressStore.updateTransient(
+            meta: meta,
+            video: currentVideo,
+            streamURL: currentEntry.stream.url,
+            position: position,
+            duration: duration
+        )
+    }
+
+    func saveProgress() {
+        lastProgressSave = Date()
+        progressStore.update(
+            meta: meta,
+            video: currentVideo,
+            streamURL: currentEntry.stream.url,
+            position: position,
+            duration: duration
+        )
+    }
+
+    /// True once the exit sequence has started — every input path (Menu, the
+    /// overlay buttons) checks it so a Back press during the exit wait can't
+    /// re-open overlays or re-enter the exit flow (the "loop while trying to
+    /// close the player").
+    private(set) var isExiting = false
+
+    /// Called when the exit sequence starts. Persists progress, halts
+    /// playback, and — crucially — releases the HDR display criteria NOW,
+    /// while the player still owns the screen. On a Dolby Vision home-screen
+    /// setup, leaving HDR content makes the TV mode-switch back into DV (the
+    /// badge in the corner); if the fullScreenCover dismisses DURING that
+    /// switch, the transition wedges and the app is left on a stuck grey
+    /// screen. PlayerScreen waits for `isDisplayModeSwitchInProgress` to
+    /// clear before dismissing (see exitPlayer). Engine teardown still runs
+    /// in `teardown()` (onDisappear) — resetting criteria twice is a no-op.
+    func prepareForExit() {
+        guard !isExiting else { return }
+        isExiting = true
+        saveProgress()
+        cacheTask?.cancel()
+        thumbnailTask?.cancel()
+        countdownTask?.cancel()
+        enginePause()
+        // Drop any overlay so the wait shows the bare (paused) video, not a
+        // half-dead confirm dialog.
+        overlay = .none
+        // Kick the display-mode switch off immediately, over the player's own
+        // screen — the same thing KSPlayerLayer's deinit would do later.
+        UIApplication.shared.windows.first?.avDisplayManager.preferredDisplayCriteria = nil
+    }
+
+    func teardown() {
+        saveProgress()
+        cacheTask?.cancel()
+        thumbnailTask?.cancel()
+        countdownTask?.cancel()
+        resyncClearTask?.cancel()
+        loadWatchdogTask?.cancel()
+        UIApplication.shared.isIdleTimerDisabled = false
+        playerLayer?.pause()
+        playerLayer?.stop()
+        playerLayer = nil
+        vlcEngine?.stop()
+        vlcEngine = nil
+    }
+
+    /// The next-episode line shown on the Up Next / Still Watching cards.
+    var upNextLine: String? {
+        guard let ep = upNextEpisode else { return nil }
+        var line = ep.seasonEpisodeCode
+        if let title = ep.title, !title.isEmpty { line += " · \(title)" }
+        return line
+    }
+
+    // MARK: - Display helpers
+
+    var displayTitle: String { meta.name }
+
+    var episodeLine: String? {
+        guard let video = currentVideo, video.season != nil else { return nil }
+        var line = video.seasonEpisodeCode
+        if let title = video.title { line += " • \(title)" }
+        return line
+    }
+
+    var viaLine: String? {
+        "via \(currentEntry.addonName) · \(currentEntry.stream.displayName) · \(engineName) engine"
+    }
+
+    var isShowingError: Bool {
+        if case .error = overlay { return true }
+        return false
+    }
+
+    // MARK: - Initial pre-cache
+
+    /// Holds the very first playback behind the loading backdrop while KSPlayer
+    /// fills its forward buffer (the reader keeps downloading while paused, up
+    /// to maxBufferDuration). Publishes progress toward `cacheTargetSeconds`,
+    /// then releases playback — so the movie opens straight into smooth,
+    /// cached video instead of stuttering on a thin buffer.
+    private func beginPrecache() {
+        guard !hasStartedPlayback else { return }
+        playerLayer?.pause()
+        loadPhase = .caching
+        cacheProgress = 0
+        cacheTask?.cancel()
+        cacheTask = Task { [weak self] in
+            let startedAt = Date()
+            var lastAhead: Double = 0
+            var lastGrowthAt = Date()
+            var growthRate: Double = 0   // smoothed seconds-of-video per second
+            while !Task.isCancelled {
+                guard let self, let player = self.playerLayer?.player else { return }
+                // Anything that sneaks playback back on (async seek callbacks,
+                // engine loadState flips) gets re-paused: the hold must hold.
+                if player.playbackState == .playing { self.playerLayer?.pause() }
+                let ahead = max(player.playableTime - player.currentPlaybackTime, 0)
+                let delta = ahead - lastAhead
+                growthRate = growthRate * 0.7 + (delta / 0.3) * 0.3
+                if delta > 0.5 {
+                    lastGrowthAt = Date()
+                }
+                lastAhead = max(lastAhead, ahead)
+                let percent = min(Int(ahead / max(self.cacheTargetSeconds, 1) * 100), 100)
+                if percent > self.cacheProgress { self.cacheProgress = percent }
+                let reachedTarget = ahead >= self.cacheTargetSeconds
+                let reachedEOF = self.duration > 0
+                    && player.playableTime >= self.duration - 0.5
+                // Download provably outruns playback — no point holding: the
+                // buffer keeps deepening while the movie plays. This is what
+                // makes fast connections start in a few seconds instead of
+                // sitting through the full caching bar.
+                let outpacing = ahead >= 6 && growthRate >= 1.2
+                // The engine stopped filling with a workable cache built —
+                // waiting longer gains nothing.
+                let plateaued = ahead >= 6
+                    && Date().timeIntervalSince(lastGrowthAt) > 3
+                let timedOut = Date().timeIntervalSince(startedAt) > self.cacheMaxWaitSeconds
+                if reachedTarget || reachedEOF || outpacing || plateaued || timedOut { break }
+                try? await Task.sleep(nanoseconds: 300_000_000)
+            }
+            guard let self, !Task.isCancelled else { return }
+            self.cacheProgress = 100
+            self.loadPhase = nil
+            self.hasStartedPlayback = true
+            // Straight into the movie — no controls flash, no chrome.
+            self.playerLayer?.play()
+        }
+    }
+
+    // MARK: - Scrub preview thumbnails
+
+    /// Kick off background preview-frame generation, delayed so it never
+    /// competes with the initial pre-cache for bandwidth. Skipped for HLS
+    /// (packetized playlists don't suit the frame grabber).
+    private func startThumbnailsIfNeeded() {
+        guard !thumbnailsStarted,
+              let url = currentURL,
+              url.pathExtension.lowercased() != "m3u8" else { return }
+        thumbnailsStarted = true
+        thumbnailTask = Task { [weak self] in
+            // The preview pass opens a SECOND connection and decodes dozens of
+            // keyframes — on a huge remux that competes with playback for both
+            // bandwidth and the decode budget. The addon-declared size is often
+            // missing (Continue Watching resumes carry none), which previously
+            // let 16 GB+ files slip through this gate and stutter playback:
+            // VERIFY the size with a HEAD request and skip when big or unknown.
+            var bytes = self?.currentEntry.stream.behaviorHints?.videoSize
+            if bytes == nil { bytes = await Self.remoteContentLength(url) }
+            guard let bytes, bytes > 0, bytes <= 8 * 1_073_741_824 else { return }
+            // Hold until the playback cache is essentially full (reader idle)
+            // so the pass never competes with the initial buffering.
+            let waitStart = Date()
+            while !Task.isCancelled {
+                guard let self else { return }
+                let ahead = self.buffered - self.position
+                // 18s ahead ≈ near-full under the tightened buffer caps
+                // (24s/36s) — reader mostly idle, safe to share the pipe.
+                if self.hasStartedPlayback && ahead >= 18 { break }
+                if Date().timeIntervalSince(waitStart) > 120 { break }
+                try? await Task.sleep(nanoseconds: 2_000_000_000)
+            }
+            guard !Task.isCancelled else { return }
+            let controller = ThumbnailController(thumbnailCount: 36)
+            guard let thumbs = try? await controller.generateThumbnail(for: url, thumbWidth: 256),
+                  !Task.isCancelled else { return }
+            self?.scrubThumbnails = thumbs.sorted { $0.time < $1.time }
+            NSLog("[NuvioPlayer] scrub previews ready: %d frames", thumbs.count)
+        }
+    }
+
+    /// Nearest preview frame for a scrub target, if generation has finished.
+    func thumbnail(at time: Double) -> UIImage? {
+        guard !scrubThumbnails.isEmpty else { return nil }
+        var best: UIImage?
+        var bestDistance = Double.infinity
+        for thumb in scrubThumbnails {
+            let distance = abs(thumb.time - time)
+            if distance < bestDistance {
+                bestDistance = distance
+                best = thumb.image
+            }
+        }
+        return best
+    }
+
+    /// Actual remote file size via a HEAD request (nil when the server won't
+    /// say). Used to gate the preview-thumbnail pass.
+    private static func remoteContentLength(_ url: URL) async -> Int64? {
+        var request = URLRequest(url: url)
+        request.httpMethod = "HEAD"
+        request.timeoutInterval = 8
+        guard let (_, response) = try? await URLSession.shared.data(for: request),
+              let http = response as? HTTPURLResponse else { return nil }
+        if let length = http.value(forHTTPHeaderField: "Content-Length"),
+           let bytes = Int64(length), bytes > 0 {
+            return bytes
+        }
+        return nil
+    }
+
+    // MARK: - Pull-down info panel
+
+    struct MediaInfoRow: Identifiable {
+        let id = UUID()
+        let label: String
+        let value: String
+    }
+
+    struct MediaInfoSection: Identifiable {
+        let id = UUID()
+        let title: String
+        let rows: [MediaInfoRow]
+    }
+
+    /// Which pull-down tab is showing: 0 = Details (title/plot/cast),
+    /// 1 = File Info (technical). Swipe left/right switches.
+    @Published var infoTab = 0
+
+    /// Full metadata for the Details tab. Playback is often started from a
+    /// stripped-down record (a Continue Watching card carries only name +
+    /// artwork), so the panel would show just "Movie". Re-fetched from the
+    /// meta addon (cached, same call the Detail screen makes).
+    @Published private(set) var enrichedMeta: MetaItem?
+    /// Best available metadata: the enriched fetch when it lands, else
+    /// whatever the player was launched with.
+    var displayMeta: MetaItem { enrichedMeta ?? meta }
+
+    /// TMDB cast with headshots, so the pull-down's Details tab shows the same
+    /// circular cast chips as the Detail page (not a plain text list).
+    @Published private(set) var tmdbCast: [TMDBService.CastMember] = []
+
+    private func fetchEnrichedMeta() {
+        // TMDB cast (with headshots) for the pull-down — same source as the
+        // Detail page's cast row, and cached inside TMDBService.
+        Task { [weak self] in
+            guard let self else { return }
+            if let detail = await TMDBService.detail(imdbID: self.meta.id, type: self.meta.type) {
+                self.tmdbCast = detail.cast
+            }
+        }
+        // Already complete (launched from a fully-loaded Detail screen)?
+        // A series additionally needs its episode list — the in-player
+        // Episodes panel and auto-next read it from the enriched meta.
+        let needsEpisodes = meta.isSeries && (meta.videos ?? []).isEmpty
+        if meta.description != nil, meta.cast?.isEmpty == false,
+           meta.genres?.isEmpty == false, !needsEpisodes {
+            return
+        }
+        Task { [weak self] in
+            guard let self,
+                  let addon = self.addonManager.metaAddon(for: self.meta.type, id: self.meta.id),
+                  let full = try? await StremioAPI.meta(addon: addon, type: self.meta.type, id: self.meta.id)
+            else { return }
+            self.enrichedMeta = full
+        }
+    }
+
+    /// Swipe-down on the bare video (Infuse gesture) opens the info sheet.
+    /// Inert until playback is running — a stray downward touch during the
+    /// loading/caching hold must never queue the panel up behind the loading
+    /// screen (it would greet the viewer the moment the movie appeared).
+    func showInfoPanel() {
+        guard hasStartedPlayback else { return }
+        guard overlay == .none || overlay == .pauseInfo else { return }
+        hideControlsTask?.cancel()
+        infoTab = 0
+        overlay = .info
+    }
+
+    func dismissInfoPanel() {
+        guard overlay == .info else { return }
+        overlay = .none
+    }
+
+    /// Snapshot of everything the pull-down shows: file, video, audio,
+    /// subtitle and live performance details, assembled from the running
+    /// player. Built on demand — the panel is transient.
+    func mediaInfoSections() -> [MediaInfoSection] {
+        var sections: [MediaInfoSection] = []
+        let player = playerLayer?.player
+
+        var file: [MediaInfoRow] = []
+        file.append(.init(label: "Source", value: currentEntry.addonName))
+        let filename = currentEntry.stream.title ?? currentEntry.stream.displayName
+        file.append(.init(label: "Name", value: filename))
+        if let url = currentURL, !url.pathExtension.isEmpty {
+            file.append(.init(label: "Container", value: url.pathExtension.uppercased()))
+        }
+        file.append(.init(label: "Engine", value: engineName))
+        if let read = player?.dynamicInfo?.bytesRead, read > 0 {
+            file.append(.init(label: "Downloaded", value: ByteCountFormatter.string(fromByteCount: read, countStyle: .file)))
+        }
+        sections.append(.init(title: "File", rows: file))
+
+        if let track = player?.tracks(mediaType: .video).first(where: \.isEnabled)
+            ?? player?.tracks(mediaType: .video).first {
+            var video: [MediaInfoRow] = []
+            video.append(.init(label: "Codec", value: Self.codecName(track)))
+            let size = track.naturalSize
+            if size.width > 0 {
+                video.append(.init(label: "Resolution", value: "\(Int(size.width)) × \(Int(size.height))"))
+            }
+            if track.nominalFrameRate > 0 {
+                video.append(.init(label: "Frame Rate", value: String(format: "%.3g fps", track.nominalFrameRate)))
+            }
+            let bitrate = player?.dynamicInfo?.videoBitrate ?? Int(track.bitRate)
+            if bitrate > 0 {
+                video.append(.init(label: "Bitrate", value: String(format: "%.1f Mbps", Double(bitrate) / 1_000_000)))
+            }
+            if track.bitDepth > 0 {
+                video.append(.init(label: "Bit Depth", value: "\(track.bitDepth)-bit"))
+            }
+            if track.dovi != nil {
+                video.append(.init(label: "HDR", value: "Dolby Vision"))
+            } else if let range = track.formatDescription?.dynamicRange, range != .sdr {
+                // HDR10 / HLG — anything beyond SDR is worth surfacing.
+                video.append(.init(label: "HDR", value: range.description))
+            }
+            sections.append(.init(title: "Video", rows: video))
+        }
+
+        if let track = player?.tracks(mediaType: .audio).first(where: \.isEnabled)
+            ?? player?.tracks(mediaType: .audio).first {
+            var audio: [MediaInfoRow] = []
+            audio.append(.init(label: "Codec", value: Self.codecName(track)))
+            let channels = Self.channelCount(track)
+            if channels > 0 {
+                audio.append(.init(label: "Channels", value: Self.channelLabel(channels)))
+            }
+            if let code = track.languageCode,
+               let language = Locale.current.localizedString(forLanguageCode: code) {
+                audio.append(.init(label: "Language", value: language))
+            }
+            let bitrate = player?.dynamicInfo?.audioBitrate ?? Int(track.bitRate)
+            if bitrate > 0 {
+                audio.append(.init(label: "Bitrate", value: String(format: "%.0f kbps", Double(bitrate) / 1_000)))
+            }
+            let count = player?.tracks(mediaType: .audio).count ?? 1
+            if count > 1 {
+                audio.append(.init(label: "Tracks", value: "\(count)"))
+            }
+            sections.append(.init(title: "Audio", rows: audio))
+        }
+
+        var subs: [MediaInfoRow] = []
+        let active = subtitleOptions.first { $0.id == selectedSubtitleID }?.displayName ?? "Off"
+        subs.append(.init(label: "Active", value: active))
+        let available = max(subtitleOptions.count - 1, 0)   // minus the "Off" row
+        subs.append(.init(label: "Available", value: available == 0 ? "None" : "\(available)"))
+        sections.append(.init(title: "Subtitles", rows: subs))
+
+        if let info = player?.dynamicInfo {
+            var perf: [MediaInfoRow] = []
+            if info.displayFPS > 0 {
+                perf.append(.init(label: "Display", value: String(format: "%.1f fps", info.displayFPS)))
+            }
+            perf.append(.init(label: "Dropped Frames", value: "\(info.droppedVideoFrameCount)"))
+            perf.append(.init(label: "AV Sync", value: String(format: "%+.0f ms", info.audioVideoSyncDiff * 1000)))
+            sections.append(.init(title: "Performance", rows: perf))
+        }
+
+        return sections
+    }
+
+    private static func codecName(_ track: any MediaPlayerTrack) -> String {
+        guard let description = track.formatDescription else { return track.name }
+        return description.mediaSubType.description
+            .trimmingCharacters(in: CharacterSet(charactersIn: "'"))
+            .uppercased()
+    }
+
+    static func channelCount(_ track: any MediaPlayerTrack) -> Int {
+        guard let asbd = track.formatDescription?.audioStreamBasicDescription else { return 0 }
+        return Int(asbd.mChannelsPerFrame)
+    }
+
+    static func channelLabel(_ count: Int) -> String {
+        switch count {
+        case 1: return "Mono"
+        case 2: return "Stereo"
+        case 6: return "5.1 Surround"
+        case 8: return "7.1 Surround"
+        default: return "\(count) channels"
+        }
+    }
+}
+
+// MARK: - KSPlayerLayerDelegate
+
+extension PlayerViewModel: KSPlayerLayerDelegate {
+    func player(layer: KSPlayerLayer, state: KSPlayerState) {
+        switch state {
+        case .initialized, .preparing:
+            isBuffering = true
+        case .readyToPlay:
+            // The stream opened successfully — the load is alive, so disarm
+            // the timeout watchdog.
+            markLoadStarted()
+            // The underlying player (and its UIView) can only have changed on
+            // ready (initial open or engine failover) — refresh the video host
+            // HERE, not on every routine buffering transition.
+            videoRefreshID = UUID()
+            refreshEngineName()
+            // Open-timing breakdown (visible in Console.app, filter "NuvioPlayer")
+            // so slow debrid opens can be attributed: connect vs FFmpeg
+            // avformat open vs stream-info probe vs first decoded frame.
+            if let started = loadStartedAt, let opts = currentOptions {
+                let total = Date().timeIntervalSince(started)
+                // Each field is an absolute CACurrentMediaTime stamp; a phase
+                // is only meaningful when both of its endpoints were recorded.
+                func delta(_ from: Double, _ to: Double) -> Double {
+                    (from > 0 && to > from) ? to - from : 0
+                }
+                NSLog("[NuvioPlayer] ready engine=%@ total=%.2fs connect=%.2fs open=%.2fs find=%.2fs firstFrame=%.2fs",
+                      engineName, total,
+                      delta(opts.tcpStartTime, opts.tcpConnectedTime),
+                      delta(opts.dnsStartTime, opts.openTime),
+                      delta(opts.openTime, opts.findTime),
+                      delta(opts.findTime, opts.readyTime))
+                loadStartedAt = nil
+            }
+            isBuffering = false
+            duration = layer.player.duration
+            clock.duration = duration
+            // Engine always letterboxes (aspect-fit); zoom/stretch happen as a
+            // SwiftUI transform driven by the natural size published here.
+            layer.player.contentMode = .scaleAspectFit
+            videoNaturalSize = layer.player.naturalSize
+            chapters = layer.player.chapters
+            applyNativeDisplayCriteria()
+            if playbackSpeed != 1 {
+                layer.player.playbackRate = playbackSpeed
+            }
+            let willPrecache = !hasStartedPlayback
+            loadTracks()
+            startThumbnailsIfNeeded()
+
+            let resume = pendingResume ?? 0
+            let meaningfulResume = resume > 30 && (duration == 0 || resume < duration - 30)
+
+            if willPrecache {
+                // Auto-resume at the saved position (if any) and hold playback
+                // to build the initial cache — no blocking prompt. A "Start
+                // Over" button in the controls bar (only shown when this title
+                // had saved progress) lets the viewer jump back to 0 anytime.
+                if cacheTargetSeconds <= 0 {
+                    // Small file: no hold — straight into the movie.
+                    if meaningfulResume {
+                        playerLayer?.seek(time: resume, autoPlay: true) { _ in }
+                    }
+                    pendingResume = nil
+                    loadPhase = nil
+                    hasStartedPlayback = true
+                    playerLayer?.play()
+                } else {
+                    if meaningfulResume {
+                        playerLayer?.seek(time: resume, autoPlay: false) { _ in }
+                    }
+                    pendingResume = nil
+                    beginPrecache()
+                }
+            } else {
+                // Engine failover / source switch mid-session: re-apply the
+                // resume seek and play straight away.
+                if resume > 5, duration == 0 || resume < duration - 30 {
+                    layer.seek(time: resume, autoPlay: true) { _ in }
+                }
+                pendingResume = nil
+                if overlay == .none { showControls() }
+            }
+        case .buffering:
+            isPlaying = true
+            isBuffering = true
+            pausedAt = nil
+        case .bufferFinished:
+            isPlaying = true
+            isBuffering = false
+            pausedAt = nil
+            // Some engines (notably the FFmpeg path) go straight to playing
+            // without a `.readyToPlay`, so dismiss the loading backdrop here
+            // too — unless the initial pre-cache is still holding playback.
+            if loadPhase != .caching { hasStartedPlayback = true }
+        case .paused:
+            isPlaying = false
+            isBuffering = false
+            // First transition into pause stamps the clock for the
+            // stale-connection recovery; later delegate re-fires keep it.
+            if pausedAt == nil { pausedAt = Date() }
+        case .playedToTheEnd:
+            isPlaying = false
+            // Post-play: queue next episode or show the end overlay instead of
+            // leaving the user on a frozen last frame.
+            handlePlayedToEnd()
+        case .error:
+            isPlaying = false
+            isBuffering = false
+            cacheTask?.cancel()
+            loadPhase = nil
+        }
+    }
+
+    func player(layer: KSPlayerLayer, currentTime: TimeInterval, totalTime: TimeInterval) {
+        // Catch-all: the clock is advancing, so playback has definitely begun —
+        // clear the loading backdrop even if no ready/buffer-finished state
+        // fired. Skipped while the initial pre-cache is holding playback.
+        if currentTime > 0, !hasStartedPlayback, loadPhase != .caching {
+            hasStartedPlayback = true
+            loadPhase = nil
+        }
+        if currentTime.isFinite { position = currentTime }
+        if totalTime.isFinite, totalTime > 0 { duration = totalTime }
+        buffered = layer.player.playableTime
+        // Publish to the clock only on meaningful change (~2Hz) so the few
+        // time-displaying views re-render gently instead of every frame.
+        if abs(clock.position - position) >= 0.4 { clock.position = position }
+        if clock.duration != duration { clock.duration = duration }
+        if abs(clock.buffered - buffered) >= 1.0 { clock.buffered = buffered }
+        // Cue lookup walks the subtitle list linearly from the START each
+        // call — late in a long movie that's thousands of iterations. Skip it
+        // entirely with subtitles off, and throttle to ~8 Hz with them on
+        // (well inside subtitle-timing tolerance).
+        if subtitleModel.selectedSubtitleInfo != nil,
+           abs(currentTime - lastSubtitleSearchAt) >= 0.12 {
+            lastSubtitleSearchAt = currentTime
+            _ = subtitleModel.subtitle(currentTime: currentTime)
+        }
+        // naturalSize can still be zero at readyToPlay (the AVPlayer engine
+        // fills it in a later load callback) — without this the aspect
+        // transform would stay identity for the whole session.
+        if videoNaturalSize == .zero {
+            let size = layer.player.naturalSize
+            if size != .zero { videoNaturalSize = size }
+        }
+        updateSkipIntro()
+        saveProgressThrottled()
+        maybeArmAutoNext()
+    }
+
+    func player(layer: KSPlayerLayer, finish error: Error?) {
+        guard let error else { return }
+        // KSPlayerLayer already retried with the FFmpeg engine before this
+        // fires, so a surviving error means both engines rejected the stream.
+        // Don't dead-end on it — fail over to the next source automatically
+        // (fetching the source list first if this session started from a bare
+        // Continue Watching URL, which also covers expired debrid links).
+        attemptFailover(afterError: error)
+    }
+
+    func player(layer: KSPlayerLayer, bufferedCount: Int, consumeTime: TimeInterval) {}
+}

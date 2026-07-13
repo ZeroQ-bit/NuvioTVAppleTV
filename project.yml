@@ -1,0 +1,92 @@
+name: NuvioTV
+options:
+  deploymentTarget:
+    tvOS: "17.0"
+  createIntermediateGroups: true
+packages:
+  KSPlayer:
+    url: https://github.com/kingslay/KSPlayer
+    revision: 10a40a1c0001d75307ad5922d1d1bc0cb01c89b4
+  # Pure-Swift YouTube stream extractor — the only way to play trailer
+  # YouTube keys on tvOS (no WebKit/WKWebView, so no iframe embed).
+  YouTubeKit:
+    url: https://github.com/alexeichhorn/YouTubeKit
+    exactVersion: 0.4.8
+  # VLCKit as a binary xcframework; the tvOS slice vends module `TVVLCKit`.
+  # Adds the VLC playback engine alongside KSPlayer.
+  VLCKit:
+    url: https://github.com/tylerjonesio/vlckit-spm
+    from: 3.6.0
+targets:
+  NuvioTV:
+    type: application
+    platform: tvOS
+    sources:
+      - NuvioTV
+    dependencies:
+      - package: KSPlayer
+      - package: YouTubeKit
+      - package: VLCKit
+        product: VLCKitSPM
+    info:
+      path: Config/Info.plist
+      properties:
+        CFBundleDisplayName: NuvioTV
+        # Tracks the Android APK release this port mirrors (v0.7.15-beta).
+        CFBundleShortVersionString: "0.7.15"
+        UIUserInterfaceStyle: Dark
+        # Lets canOpenURL detect external players for handoff (Infuse etc.).
+        LSApplicationQueriesSchemes:
+          - infuse
+          - infuse-x-callback
+        NSAppTransportSecurity:
+          NSAllowsArbitraryLoads: true
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.nuvio.tv.appletv
+        SWIFT_VERSION: "5.9"
+        TARGETED_DEVICE_FAMILY: "3"
+        # Tracks the Android APK release this port mirrors (v0.7.15-beta).
+        MARKETING_VERSION: "0.7.15"
+        CURRENT_PROJECT_VERSION: "1"
+        # The sanitize script below writes into the built .app, so user
+        # script sandboxing must be off or the phase is denied file access.
+        ENABLE_USER_SCRIPT_SANDBOXING: false
+        ASSETCATALOG_COMPILER_APPICON_NAME: "App Icon & Top Shelf Image"
+    postBuildScripts:
+      # FFmpegKit (pulled in transitively by KSPlayer) ships
+      # libshaderc_combined.framework with an underscore in its
+      # CFBundleIdentifier (com.kintan.ksplayer.libshaderc_combined).
+      # Underscores are illegal in a bundle id, so Xcode's product
+      # validation phase rejects the embedded framework and the build
+      # fails. VALIDATE_PRODUCT=NO does NOT gate this particular check,
+      # and there is no build setting that disables it, so instead we
+      # rewrite any offending embedded framework id to use hyphens and
+      # re-sign the framework before validation runs.
+      - name: "Sanitize embedded framework bundle IDs"
+        basedOnDependencyAnalysis: false
+        script: |
+          set -eu
+          FW_DIR="${CODESIGNING_FOLDER_PATH}/Frameworks"
+          [ -d "$FW_DIR" ] || exit 0
+          IDENTITY="${EXPANDED_CODE_SIGN_IDENTITY:--}"
+          for fw in "$FW_DIR"/*.framework; do
+            plist="$fw/Info.plist"
+            [ -f "$plist" ] || continue
+            bid=$(/usr/libexec/PlistBuddy -c "Print :CFBundleIdentifier" "$plist" 2>/dev/null || true)
+            case "$bid" in
+              *_*)
+                newbid=$(printf '%s' "$bid" | tr '_' '-')
+                /usr/libexec/PlistBuddy -c "Set :CFBundleIdentifier $newbid" "$plist"
+                codesign --force --sign "$IDENTITY" --timestamp=none "$fw"
+                echo "note: sanitized bundle id $bid -> $newbid"
+                ;;
+            esac
+          done
+schemes:
+  NuvioTV:
+    build:
+      targets:
+        NuvioTV: all
+    run:
+      config: Debug

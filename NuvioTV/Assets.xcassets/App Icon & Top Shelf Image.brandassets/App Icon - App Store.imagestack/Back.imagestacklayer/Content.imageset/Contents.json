@@ -1,0 +1,17 @@
+{
+  "images" : [
+    {
+      "filename" : "ChatGPT Image Jul 13, 2026, 03_54_16 PM.png",
+      "idiom" : "tv",
+      "scale" : "1x"
+    },
+    {
+      "idiom" : "tv",
+      "scale" : "2x"
+    }
+  ],
+  "info" : {
+    "author" : "xcode",
+    "version" : 1
+  }
+}

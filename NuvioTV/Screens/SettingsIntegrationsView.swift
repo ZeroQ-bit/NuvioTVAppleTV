@@ -1,0 +1,466 @@
+import SwiftUI
+
+/// Settings → Integrations: TMDB and Debrid (Real-Debrid, Premiumize, TorBox,
+/// AllDebrid). Trakt has its own top-level pane. Debrid section is added in a
+/// later stage.
+struct IntegrationsDetail: View {
+    @EnvironmentObject private var theme: ThemeManager
+    @EnvironmentObject private var tmdb: TMDBSettingsStore
+    @EnvironmentObject private var mdblist: MDBListSettingsStore
+    @EnvironmentObject private var debrid: DebridStore
+    @State private var sheet: IntegrationSheet?
+
+    enum IntegrationSheet: String, Identifiable { case tmdb, mdblist, debrid; var id: String { rawValue } }
+
+    var body: some View {
+        // APK layout: a single list of drill-in rows, each opening a sub-screen.
+        DetailScaffold(title: SettingsCategory.integration.title, subtitle: SettingsCategory.integration.subtitle) {
+            SettingsGroupCard(title: "") {
+                // Nuvio account moved to Settings → Account.
+                integrationRow(title: "TMDB", subtitle: "Metadata enrichment controls") { sheet = .tmdb }
+                integrationRow(title: "MDBList", subtitle: "External ratings providers") { sheet = .mdblist }
+                integrationRow(title: "Debrid", subtitle: "Cached torrent sources as direct streams") { sheet = .debrid }
+            }
+        }
+        .fullScreenCover(item: $sheet) { s in
+            ZStack {
+                theme.palette.background.ignoresSafeArea()
+                integrationSheet(s)
+            }
+            .environmentObject(theme)
+            .environmentObject(tmdb)
+            .environmentObject(mdblist)
+            .environmentObject(debrid)
+            .onExitCommand { sheet = nil }
+        }
+    }
+
+    private func integrationRow(title: String, subtitle: String, action: @escaping () -> Void) -> some View {
+        Button(action: action) {
+            SettingsValueCard(title: title, subtitle: subtitle, value: "")
+        }
+        .buttonStyle(PlainCardButtonStyle())
+    }
+
+    @ViewBuilder
+    private func integrationSheet(_ s: IntegrationSheet) -> some View {
+        switch s {
+        case .tmdb:
+            DetailScaffold(title: "TMDB", subtitle: "Metadata enrichment controls") {
+                SettingsGroupCard(title: "") { tmdbSection }
+            }
+        case .mdblist:
+            DetailScaffold(title: "MDBList", subtitle: "External ratings providers") {
+                SettingsGroupCard(title: "") { mdblistSection }
+            }
+        case .debrid:
+            DetailScaffold(title: "Debrid", subtitle: "Cached torrent sources as direct, high-speed streams") {
+                SettingsGroupCard(title: "") { debridSection }
+            }
+        }
+    }
+
+    // MARK: - MDBList
+
+    private var mdblistSection: some View {
+        VStack(alignment: .leading, spacing: NuvioSpacing.md) {
+            SettingsToggleCard(
+                title: "Enable MDBList ratings",
+                subtitle: "Aggregate scores across rating sources",
+                isOn: Binding(get: { mdblist.settings.enabled }, set: { mdblist.settings.enabled = $0 })
+            )
+
+            if mdblist.settings.enabled {
+                MDBListKeyRow()
+                ForEach(MDBListProvider.allCases) { provider in
+                    MDBListProviderToggle(provider: provider)
+                }
+            }
+
+            Text("Get a key at mdblist.com/preferences.")
+                .font(.system(size: 18))
+                .foregroundStyle(theme.palette.textTertiary)
+                .padding(.top, 2)
+        }
+    }
+
+    // MARK: - Debrid
+
+    private var debridSection: some View {
+        VStack(alignment: .leading, spacing: NuvioSpacing.md) {
+            ForEach(DebridProvider.allCases) { provider in
+                DebridProviderRow(provider: provider)
+            }
+
+            if debrid.configuredProviders.count > 1 {
+                PreferredProviderRow()
+                    .padding(.top, NuvioSpacing.sm)
+            }
+        }
+    }
+
+    // MARK: - TMDB
+
+    private var tmdbSection: some View {
+        VStack(alignment: .leading, spacing: NuvioSpacing.md) {
+            SettingsToggleCard(
+                title: "Enable TMDB",
+                subtitle: "Powers TMDB collection sources (lists, collections, companies, networks, discover)",
+                isOn: Binding(get: { tmdb.settings.enabled }, set: { tmdb.settings.enabled = $0 })
+            )
+
+            if tmdb.settings.enabled {
+                SettingsToggleCard(
+                    title: "Enrich Continue Watching",
+                    subtitle: "Use TMDB artwork and titles for synced progress rows",
+                    isOn: Binding(get: { tmdb.settings.enrichContinueWatching }, set: { tmdb.settings.enrichContinueWatching = $0 })
+                )
+
+                NuvioDropdown(
+                    title: "Language",
+                    subtitle: "TMDB metadata language",
+                    selection: tmdb.settings.language,
+                    options: TMDBLanguages.options.map { NuvioDropdownOption($0, TMDBLanguages.displayName($0)) }
+                ) { tmdb.settings.language = $0 }
+            }
+
+            Text("Uses a shared, app-embedded TMDB API key — no sign-in required.")
+                .font(.system(size: 18))
+                .foregroundStyle(theme.palette.textTertiary)
+                .padding(.top, 2)
+        }
+    }
+
+    private func integrationToggleLabel(title: String, subtitle: String) -> some View {
+        VStack(alignment: .leading, spacing: 3) {
+            Text(title)
+                .font(.system(size: 25, weight: .medium))
+                .foregroundStyle(theme.palette.textPrimary)
+            Text(subtitle)
+                .font(.system(size: 19))
+                .foregroundStyle(theme.palette.textSecondary)
+                .lineLimit(2)
+        }
+    }
+}
+
+// MARK: - Debrid rows
+
+private struct DebridProviderRow: View {
+    @EnvironmentObject private var theme: ThemeManager
+    @EnvironmentObject private var debrid: DebridStore
+    let provider: DebridProvider
+
+    @State private var showEditor = false
+
+    private var isConfigured: Bool { !debrid.key(for: provider).isEmpty }
+
+    var body: some View {
+        Button { showEditor = true } label: {
+            HStack(spacing: NuvioSpacing.lg) {
+                Text(provider.shortName)
+                    .font(.system(size: 20, weight: .heavy))
+                    .foregroundStyle(theme.palette.onSecondary)
+                    .frame(width: 54, height: 40)
+                    .background(
+                        RoundedRectangle(cornerRadius: 8)
+                            .fill(isConfigured ? NuvioPrimitives.success : theme.palette.surfaceVariant)
+                    )
+                VStack(alignment: .leading, spacing: 3) {
+                    Text(provider.displayName)
+                        .font(.system(size: 25, weight: .medium))
+                        .foregroundStyle(theme.palette.textPrimary)
+                    Text(isConfigured ? "Connected · key set" : "Key from \(provider.keyHint)")
+                        .font(.system(size: 19))
+                        .foregroundStyle(isConfigured ? NuvioPrimitives.success : theme.palette.textSecondary)
+                }
+                Spacer()
+                if debrid.preferred == provider && debrid.configuredProviders.count > 1 {
+                    MetaBadge(text: "PREFERRED", tint: theme.palette.secondary.opacity(0.2), textColor: theme.palette.secondary)
+                }
+                Image(systemName: isConfigured ? "checkmark.circle.fill" : "plus.circle")
+                    .font(.system(size: 26))
+                    .foregroundStyle(isConfigured ? NuvioPrimitives.success : theme.palette.textTertiary)
+            }
+            .integrationRowBackground(theme)
+        }
+        .buttonStyle(PlainCardButtonStyle())
+        .fullScreenCover(isPresented: $showEditor) {
+            DebridKeyEditor(provider: provider) { showEditor = false }
+                .environmentObject(theme)
+                .environmentObject(debrid)
+        }
+    }
+}
+
+private struct PreferredProviderRow: View {
+    @EnvironmentObject private var debrid: DebridStore
+
+    var body: some View {
+        NuvioDropdown(
+            title: "Preferred provider",
+            subtitle: "Used first when a stream is cached on more than one",
+            selection: debrid.preferred?.id ?? "",
+            options: debrid.configuredProviders.map { NuvioDropdownOption($0.id, $0.displayName) }
+        ) { picked in
+            debrid.preferred = DebridProvider.allCases.first { $0.id == picked }
+        }
+    }
+}
+
+private struct DebridKeyEditor: View {
+    @EnvironmentObject private var theme: ThemeManager
+    @EnvironmentObject private var debrid: DebridStore
+    let provider: DebridProvider
+    let onDone: () -> Void
+
+    @State private var key = ""
+    @State private var validating = false
+    @State private var status: String?
+
+    var body: some View {
+        ZStack {
+            theme.palette.background.ignoresSafeArea()
+            VStack(spacing: NuvioSpacing.xl) {
+                Text("\(provider.displayName) API Key")
+                    .font(.system(size: 40, weight: .bold))
+                    .foregroundStyle(theme.palette.textPrimary)
+                Text("Get your key at \(provider.keyHint)")
+                    .font(.system(size: 22))
+                    .foregroundStyle(theme.palette.textSecondary)
+
+                SecureField("Paste API key", text: $key)
+                    .font(.system(size: 24))
+                    .frame(maxWidth: 760)
+
+                if let status {
+                    Text(status)
+                        .font(.system(size: 20))
+                        .foregroundStyle(status.hasPrefix("Valid") ? NuvioPrimitives.success : NuvioPrimitives.error)
+                }
+
+                HStack(spacing: NuvioSpacing.lg) {
+                    Button(action: verifyAndSave) {
+                        if validating { ProgressView().tint(theme.palette.onSecondary) }
+                        else { Text("Verify & Save") }
+                    }
+                    .disabled(validating || key.trimmingCharacters(in: .whitespaces).isEmpty)
+                    if !debrid.key(for: provider).isEmpty {
+                        Button("Remove", role: .destructive) {
+                            debrid.setKey("", for: provider)
+                            onDone()
+                        }
+                    }
+                    Button("Cancel", role: .cancel, action: onDone)
+                }
+                .font(.system(size: 24, weight: .semibold))
+            }
+            .padding(NuvioSpacing.huge)
+        }
+        .onAppear { key = debrid.key(for: provider) }
+        // Same as Cancel — dismiss without saving.
+        .onExitCommand { onDone() }
+    }
+
+    private func verifyAndSave() {
+        validating = true
+        status = nil
+        let trimmed = key.trimmingCharacters(in: .whitespaces)
+        Task {
+            let valid = await DebridService.validate(provider: provider, apiKey: trimmed)
+            validating = false
+            if valid {
+                debrid.setKey(trimmed, for: provider)
+                status = "Valid — saved."
+                onDone()
+            } else {
+                status = "Invalid key or network error."
+            }
+        }
+    }
+}
+
+// MARK: - MDBList rows
+
+private struct MDBListKeyRow: View {
+    @EnvironmentObject private var theme: ThemeManager
+    @EnvironmentObject private var mdblist: MDBListSettingsStore
+    @State private var showEditor = false
+
+    private var isConfigured: Bool {
+        !mdblist.settings.apiKey.trimmingCharacters(in: .whitespaces).isEmpty
+    }
+
+    var body: some View {
+        Button { showEditor = true } label: {
+            HStack(spacing: NuvioSpacing.lg) {
+                VStack(alignment: .leading, spacing: 3) {
+                    Text("API Key")
+                        .font(.system(size: 25, weight: .medium))
+                        .foregroundStyle(theme.palette.textPrimary)
+                    Text(isConfigured ? "Connected · key set" : "Tap to paste your MDBList key")
+                        .font(.system(size: 19))
+                        .foregroundStyle(isConfigured ? NuvioPrimitives.success : theme.palette.textSecondary)
+                }
+                Spacer()
+                Image(systemName: isConfigured ? "checkmark.circle.fill" : "plus.circle")
+                    .font(.system(size: 26))
+                    .foregroundStyle(isConfigured ? NuvioPrimitives.success : theme.palette.textTertiary)
+            }
+            .integrationRowBackground(theme)
+        }
+        .buttonStyle(PlainCardButtonStyle())
+        .fullScreenCover(isPresented: $showEditor) {
+            MDBListKeyEditor { showEditor = false }
+                .environmentObject(theme)
+                .environmentObject(mdblist)
+        }
+    }
+}
+
+private struct MDBListProviderToggle: View {
+    @EnvironmentObject private var theme: ThemeManager
+    @EnvironmentObject private var mdblist: MDBListSettingsStore
+    let provider: MDBListProvider
+
+    private var binding: Binding<Bool> {
+        Binding(
+            get: {
+                switch provider {
+                case .trakt: return mdblist.settings.showTrakt
+                case .imdb: return mdblist.settings.showImdb
+                case .tmdb: return mdblist.settings.showTmdb
+                case .letterboxd: return mdblist.settings.showLetterboxd
+                case .tomatoes: return mdblist.settings.showTomatoes
+                case .audience: return mdblist.settings.showAudience
+                case .metacritic: return mdblist.settings.showMetacritic
+                }
+            },
+            set: { newValue in
+                switch provider {
+                case .trakt: mdblist.settings.showTrakt = newValue
+                case .imdb: mdblist.settings.showImdb = newValue
+                case .tmdb: mdblist.settings.showTmdb = newValue
+                case .letterboxd: mdblist.settings.showLetterboxd = newValue
+                case .tomatoes: mdblist.settings.showTomatoes = newValue
+                case .audience: mdblist.settings.showAudience = newValue
+                case .metacritic: mdblist.settings.showMetacritic = newValue
+                }
+            }
+        )
+    }
+
+    var body: some View {
+        SettingsToggleCard(title: provider.fullName, subtitle: "", isOn: binding)
+    }
+}
+
+private struct MDBListKeyEditor: View {
+    @EnvironmentObject private var theme: ThemeManager
+    @EnvironmentObject private var mdblist: MDBListSettingsStore
+    let onDone: () -> Void
+
+    @State private var key = ""
+    @State private var validating = false
+    @State private var status: String?
+
+    var body: some View {
+        ZStack {
+            theme.palette.background.ignoresSafeArea()
+            VStack(spacing: NuvioSpacing.xl) {
+                Text("MDBList API Key")
+                    .font(.system(size: 40, weight: .bold))
+                    .foregroundStyle(theme.palette.textPrimary)
+                Text("Get your key at mdblist.com/preferences")
+                    .font(.system(size: 22))
+                    .foregroundStyle(theme.palette.textSecondary)
+
+                SecureField("Paste API key", text: $key)
+                    .font(.system(size: 24))
+                    .frame(maxWidth: 760)
+
+                if let status {
+                    Text(status)
+                        .font(.system(size: 20))
+                        .foregroundStyle(status.hasPrefix("Valid") ? NuvioPrimitives.success : NuvioPrimitives.error)
+                }
+
+                HStack(spacing: NuvioSpacing.lg) {
+                    Button(action: verifyAndSave) {
+                        if validating { ProgressView().tint(theme.palette.onSecondary) }
+                        else { Text("Verify & Save") }
+                    }
+                    .disabled(validating || key.trimmingCharacters(in: .whitespaces).isEmpty)
+                    if !mdblist.settings.apiKey.isEmpty {
+                        Button("Remove", role: .destructive) {
+                            mdblist.settings.apiKey = ""
+                            onDone()
+                        }
+                    }
+                    Button("Cancel", role: .cancel, action: onDone)
+                }
+                .font(.system(size: 24, weight: .semibold))
+            }
+            .padding(NuvioSpacing.huge)
+        }
+        .onAppear { key = mdblist.settings.apiKey }
+        // Same as Cancel — dismiss without saving.
+        .onExitCommand { onDone() }
+    }
+
+    private func verifyAndSave() {
+        validating = true
+        status = nil
+        let trimmed = key.trimmingCharacters(in: .whitespaces)
+        Task {
+            let valid = await MDBListService.validate(apiKey: trimmed)
+            validating = false
+            if valid {
+                mdblist.settings.apiKey = trimmed
+                status = "Valid — saved."
+                onDone()
+            } else {
+                status = "Invalid key or network error."
+            }
+        }
+    }
+}
+
+/// A small curated ISO-639-1 language list for the TMDB language picker.
+enum TMDBLanguages {
+    static let options = ["en", "es", "fr", "de", "it", "pt", "ja", "ko", "zh", "hi", "ru", "ar"]
+
+    static func displayName(_ code: String) -> String {
+        Locale.current.localizedString(forLanguageCode: code)?.capitalized ?? code.uppercased()
+    }
+}
+
+/// Shared card background for integration rows. Reads `isFocused` so that when
+/// the row is the label of a focusable Button (which `PlainCardButtonStyle`
+/// otherwise strips of all focus chrome) it still shows the fill + accent ring.
+/// On non-focusable rows `isFocused` stays false, giving a plain static card.
+private struct IntegrationRowBackground: ViewModifier {
+    @EnvironmentObject private var theme: ThemeManager
+    @Environment(\.isFocused) private var isFocused
+    func body(content: Content) -> some View {
+        content
+            .padding(.horizontal, NuvioSpacing.lg)
+            .frame(minHeight: 68)
+            .frame(maxWidth: .infinity)
+            .background(
+                RoundedRectangle(cornerRadius: NuvioRadius.md, style: .continuous)
+                    .fill(isFocused ? theme.palette.focusBackground : theme.palette.backgroundCard.opacity(0.5))
+            )
+            .overlay(
+                RoundedRectangle(cornerRadius: NuvioRadius.md, style: .continuous)
+                    .strokeBorder(isFocused ? theme.palette.focusRing : .clear, lineWidth: 4)
+            )
+    }
+}
+
+extension View {
+    /// Shared, focus-aware card background for integration rows.
+    func integrationRowBackground(_ theme: ThemeManager) -> some View {
+        modifier(IntegrationRowBackground())
+    }
+}

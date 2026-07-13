@@ -1,0 +1,254 @@
+import SwiftUI
+
+/// Settings → Trakt: device-code sign-in, scrobble toggle, and account status.
+struct TraktDetail: View {
+    @EnvironmentObject private var theme: ThemeManager
+    @EnvironmentObject private var trakt: TraktStore
+
+    @State private var deviceCode: TraktDeviceCode?
+    @State private var polling = false
+    @State private var statusMessage: String?
+    @State private var pollTask: Task<Void, Never>?
+    @State private var showConnect = false
+    @State private var codeExpiresAt: Date?
+
+    var body: some View {
+        DetailScaffold(title: SettingsCategory.trakt.title, subtitle: SettingsCategory.trakt.subtitle) {
+            if trakt.isSignedIn {
+                signedInView
+            } else {
+                signedOutView
+            }
+        }
+        .onDisappear { pollTask?.cancel() }
+        // The device-code QR gets its OWN full-screen page (APK-style) instead
+        // of squeezing into the settings pane.
+        .fullScreenCover(isPresented: $showConnect) {
+            ZStack {
+                theme.palette.background.ignoresSafeArea()
+                if let code = deviceCode {
+                    TraktConnectPage(code: code, expiresAt: codeExpiresAt ?? Date())
+                        // Rebuild when the code changes (auto-refresh) so the QR
+                        // + code + countdown all reset to the new code.
+                        .id(code.userCode)
+                }
+            }
+            .environmentObject(theme)
+            .onExitCommand { cancelConnect() }
+        }
+    }
+
+    // MARK: Signed in
+
+    private var signedInView: some View {
+        VStack(alignment: .leading, spacing: NuvioSpacing.lg) {
+            HStack(spacing: NuvioSpacing.lg) {
+                Image(systemName: "checkmark.seal.fill")
+                    .font(.system(size: 40))
+                    .foregroundStyle(NuvioPrimitives.success)
+                VStack(alignment: .leading, spacing: 3) {
+                    Text(trakt.username ?? "Connected")
+                        .font(.system(size: 28, weight: .bold))
+                        .foregroundStyle(theme.palette.textPrimary)
+                    Text("Trakt account linked")
+                        .font(.system(size: 20))
+                        .foregroundStyle(theme.palette.textSecondary)
+                }
+            }
+            .integrationRowBackground(theme)
+
+            SettingsToggleCard(
+                title: "Scrobble playback",
+                subtitle: "Automatically mark what you watch on Trakt",
+                isOn: $trakt.scrobbleEnabled
+            )
+
+            Button { trakt.signOut() } label: {
+                DestructivePillLabel(title: "Sign Out")
+            }
+            .buttonStyle(PlainCardButtonStyle())
+            .padding(.top, NuvioSpacing.sm)
+        }
+    }
+
+    // MARK: Signed out
+
+    private var signedOutView: some View {
+        VStack(alignment: .leading, spacing: NuvioSpacing.lg) {
+            Button(action: startLogin) {
+                SettingsActionRow(
+                    title: "Login",
+                    subtitle: "Sign in with a code on trakt.tv/activate",
+                    leadingIcon: "link"
+                )
+            }
+            .buttonStyle(PlainCardButtonStyle())
+
+            if let statusMessage {
+                Text(statusMessage)
+                    .font(.system(size: 20))
+                    .foregroundStyle(theme.palette.textSecondary)
+            }
+        }
+    }
+
+    // MARK: Actions
+
+    private func startLogin() {
+        showConnect = true
+        Task { await loadCode() }
+    }
+
+    /// Request a fresh device code and (re)start polling. Called on Login and
+    /// automatically whenever the current code expires, so a new code always
+    /// replaces the old one without leaving the page.
+    private func loadCode() async {
+        statusMessage = nil
+        do {
+            let code = try await TraktService.startDeviceCode()
+            deviceCode = code
+            codeExpiresAt = Date().addingTimeInterval(TimeInterval(code.expiresIn))
+            beginPolling(code)
+        } catch {
+            statusMessage = "Couldn't start Trakt login: \(error.localizedDescription)"
+            showConnect = false
+        }
+    }
+
+    /// Cancel from the QR page (Menu/back): stop polling and close.
+    private func cancelConnect() {
+        pollTask?.cancel()
+        polling = false
+        deviceCode = nil
+        codeExpiresAt = nil
+        showConnect = false
+    }
+
+    private func beginPolling(_ code: TraktDeviceCode) {
+        polling = true
+        pollTask?.cancel()
+        pollTask = Task {
+            let deadline = Date().addingTimeInterval(TimeInterval(code.expiresIn))
+            while !Task.isCancelled && Date() < deadline {
+                let result = await TraktService.pollToken(deviceCode: code.deviceCode, clientSecret: TraktStore.clientSecret)
+                switch result {
+                case .authorized(let access, let refresh):
+                    trakt.store(access: access, refresh: refresh)
+                    let name = await TraktService.fetchUsername(accessToken: access)
+                    trakt.setUsername(name)
+                    polling = false
+                    deviceCode = nil
+                    codeExpiresAt = nil
+                    showConnect = false
+                    return
+                case .needsSecret:
+                    // No client secret configured yet — keep the QR page up and
+                    // keep waiting instead of closing it. Wait the poll interval
+                    // so we don't spin.
+                    try? await Task.sleep(nanoseconds: UInt64(max(code.interval, 5)) * 1_000_000_000)
+                case .expired:
+                    // Code expired mid-poll: fetch a fresh one and keep going.
+                    if !Task.isCancelled && showConnect { await loadCode() }
+                    return
+                case .failed(let message):
+                    polling = false
+                    deviceCode = nil
+                    codeExpiresAt = nil
+                    showConnect = false
+                    statusMessage = message
+                    return
+                case .pending:
+                    try? await Task.sleep(nanoseconds: UInt64(max(code.interval, 1)) * 1_000_000_000)
+                }
+            }
+            // Deadline reached without a terminal result → auto-refresh the code
+            // (a new one pops up) as long as the page is still open.
+            if !Task.isCancelled && showConnect {
+                await loadCode()
+            }
+        }
+    }
+}
+
+/// A destructive text-pill matching the app's own design system (font,
+/// focus ring, capsule fill) instead of tvOS's native bordered button chrome
+/// — a bare `Button(role: .destructive)` renders with the system font/style,
+/// which looks out of place next to the app's custom controls.
+private struct DestructivePillLabel: View {
+    @EnvironmentObject private var theme: ThemeManager
+    @Environment(\.isFocused) private var isFocused
+    let title: String
+
+    var body: some View {
+        Text(title)
+            .font(.system(size: 24, weight: .semibold))
+            .foregroundStyle(isFocused ? .white : NuvioPrimitives.red300)
+            .padding(.horizontal, NuvioSpacing.xl)
+            .padding(.vertical, NuvioSpacing.md)
+            .background(
+                Capsule(style: .continuous)
+                    .fill(isFocused ? NuvioPrimitives.red500 : NuvioPrimitives.red500.opacity(0.16))
+            )
+            .overlay(
+                Capsule(style: .continuous)
+                    .strokeBorder(isFocused ? theme.palette.focusRing : .clear, lineWidth: 3)
+            )
+            .scaleEffect(isFocused ? 1.05 : 1)
+            .animation(.spring(response: 0.3, dampingFraction: 0.8), value: isFocused)
+    }
+}
+
+/// Full-screen Trakt device-code page: big centered QR + code + status, the
+/// APK's dedicated login page. Menu/Back cancels (handled by the presenter).
+struct TraktConnectPage: View {
+    @EnvironmentObject private var theme: ThemeManager
+    let code: TraktDeviceCode
+    /// When the current code stops being valid — drives the countdown.
+    let expiresAt: Date
+
+    var body: some View {
+        VStack(spacing: NuvioSpacing.xl) {
+            VStack(spacing: NuvioSpacing.sm) {
+                Text("Connect Trakt")
+                    .font(.system(size: 48, weight: .heavy))
+                    .foregroundStyle(theme.palette.textPrimary)
+                Text("Scan the code with your phone, or go to \(code.verificationURL) and enter the code below.")
+                    .font(.system(size: 24))
+                    .foregroundStyle(theme.palette.textSecondary)
+                    .multilineTextAlignment(.center)
+                    .frame(maxWidth: 900)
+            }
+
+            // Scanning opens the Trakt authorize page with the code pre-filled.
+            QRCodeView(string: "https://trakt.tv/activate/authorize?user_code=\(code.userCode)", side: 360)
+
+            Text(code.userCode)
+                .font(.system(size: 68, weight: .heavy, design: .monospaced))
+                .tracking(10)
+                .foregroundStyle(theme.palette.secondary)
+
+            HStack(spacing: NuvioSpacing.sm) {
+                ProgressView().tint(theme.palette.secondary)
+                Text("Waiting for authorization…")
+                    .font(.system(size: 22))
+                    .foregroundStyle(theme.palette.textTertiary)
+            }
+
+            // Live countdown; a new code is fetched automatically when it hits 0.
+            TimelineView(.periodic(from: .now, by: 1)) { context in
+                let remaining = max(0, Int(expiresAt.timeIntervalSince(context.date)))
+                Text(remaining > 0
+                     ? "Code expires in \(remaining / 60):\(String(format: "%02d", remaining % 60))"
+                     : "Refreshing code…")
+                    .font(.system(size: 20))
+                    .foregroundStyle(theme.palette.textTertiary)
+            }
+
+            Text("Press Menu to cancel")
+                .font(.system(size: 20))
+                .foregroundStyle(theme.palette.textTertiary)
+        }
+        .padding(NuvioSpacing.huge)
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+    }
+}

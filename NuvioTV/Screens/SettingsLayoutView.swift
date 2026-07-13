@@ -1,0 +1,664 @@
+import SwiftUI
+
+// MARK: - Layout pane (home row customization)
+
+/// One customizable home row as shown in the Layout pane.
+private struct LayoutRowInfo: Identifiable {
+    let key: String
+    let defaultTitle: String
+    let subtitle: String
+    let isCollection: Bool
+    var id: String { key }
+}
+
+/// Settings → Layout: reorder, rename, and show/hide the home screen rows
+/// (addon catalogs and collections), mirroring the Android Layout settings.
+/// All changes sync via `sync_push_home_catalog_settings`.
+struct LayoutSettingsDetail: View {
+    @EnvironmentObject private var theme: ThemeManager
+    @EnvironmentObject private var settings: HomeCatalogSettingsStore
+
+    var body: some View {
+        DetailScaffold(title: SettingsCategory.layout.title, subtitle: SettingsCategory.layout.subtitle) {
+            SettingsGroupCard(title: "Home Layout", subtitle: "Choose your home screen layout") {
+                HStack(spacing: NuvioSpacing.md) {
+                    ForEach(HomeLayout.allCases) { option in
+                        Button { settings.homeLayout = option } label: {
+                            LayoutPreviewCard(option: option, selected: settings.homeLayout == option)
+                        }
+                        .buttonStyle(PlainCardButtonStyle())
+                    }
+                }
+
+                if settings.homeLayout == .modern {
+                    SettingsToggleCard(
+                        title: "Landscape Posters",
+                        subtitle: "Switch between portrait and landscape cards for Modern view",
+                        isOn: $settings.landscapePosters
+                    )
+                }
+            }
+
+            CatalogOrderSection()
+        }
+    }
+}
+
+/// The reorder / rename / show-hide list of home catalog rows. Shared by the
+/// Layout pane and the Addons → Catalog Order entry (the APK files catalog
+/// order under Add-ons).
+struct CatalogOrderSection: View {
+    @EnvironmentObject private var theme: ThemeManager
+    @EnvironmentObject private var addonManager: AddonManager
+    @EnvironmentObject private var collections: CollectionsStore
+    @EnvironmentObject private var settings: HomeCatalogSettingsStore
+
+    @State private var renamingRow: LayoutRowInfo?
+    @State private var renameText = ""
+
+    private var rows: [LayoutRowInfo] {
+        var byKey: [String: LayoutRowInfo] = [:]
+        var catalogKeys: [String] = []
+        var collectionKeys: [String] = []
+        for addon in addonManager.catalogAddons {
+            for catalog in (addon.manifest.catalogs ?? []) where !catalog.requiresExtra {
+                let key = HomeCatalogSettingsStore.catalogKey(
+                    addonID: addon.manifest.id, type: catalog.type, catalogID: catalog.id
+                )
+                guard byKey[key] == nil else { continue }
+                catalogKeys.append(key)
+                byKey[key] = LayoutRowInfo(
+                    key: key,
+                    defaultTitle: catalog.displayName,
+                    subtitle: addon.manifest.name,
+                    isCollection: false
+                )
+            }
+        }
+        for collection in collections.collections {
+            let key = HomeCatalogSettingsStore.collectionKey(collection.id)
+            collectionKeys.append(key)
+            byKey[key] = LayoutRowInfo(
+                key: key,
+                defaultTitle: collection.title,
+                subtitle: "Collection · \(collection.folders.count) folder\(collection.folders.count == 1 ? "" : "s")",
+                isCollection: true
+            )
+        }
+        return settings
+            .mergedOrder(catalogKeys: catalogKeys, collectionKeys: collectionKeys)
+            .compactMap { byKey[$0] }
+    }
+
+    var body: some View {
+        let rows = self.rows
+        let allKeys = rows.map(\.key)
+        SettingsGroupCard(title: "Home Rows", subtitle: "Reorder, rename and hide your catalog rows") {
+            ForEach(rows) { row in
+                LayoutRowView(
+                    row: row,
+                    title: settings.customTitle(for: row.key) ?? row.defaultTitle,
+                    isRenamed: settings.customTitle(for: row.key) != nil,
+                    enabled: settings.isEnabled(key: row.key),
+                    onMoveUp: { settings.move(key: row.key, up: true, within: allKeys) },
+                    onMoveDown: { settings.move(key: row.key, up: false, within: allKeys) },
+                    onToggle: { settings.setEnabled(!settings.isEnabled(key: row.key), key: row.key) },
+                    onRename: {
+                        renameText = settings.customTitle(for: row.key) ?? ""
+                        renamingRow = row
+                    }
+                )
+            }
+
+            if rows.isEmpty {
+                Text("No home rows yet — install a catalog add-on first.")
+                    .font(.system(size: 21))
+                    .foregroundStyle(theme.palette.textSecondary)
+            }
+        }
+        .fullScreenCover(item: $renamingRow) { row in
+            RenameRowView(
+                title: row.defaultTitle,
+                text: $renameText,
+                onSave: {
+                    settings.setCustomTitle(renameText, key: row.key)
+                    renamingRow = nil
+                },
+                onClear: {
+                    settings.setCustomTitle(nil, key: row.key)
+                    renamingRow = nil
+                },
+                onCancel: { renamingRow = nil }
+            )
+            .environmentObject(theme)
+        }
+    }
+}
+
+/// Full-screen "Catalog Order" cover opened from the Addons screen. Menu/Back
+/// returns to the Addons list.
+struct CatalogOrderCoverView: View {
+    @EnvironmentObject private var theme: ThemeManager
+    let onDone: () -> Void
+
+    var body: some View {
+        ZStack {
+            theme.palette.background.ignoresSafeArea()
+            DetailScaffold(title: "Catalog Order", subtitle: "Reorder, rename and hide your home catalog rows") {
+                CatalogOrderSection()
+            }
+        }
+        .onExitCommand { onDone() }
+    }
+}
+
+/// Selectable card for a home layout option (Classic / Modern / Grid).
+/// A visual wireframe preview card for a home layout (Modern / Grid / Classic),
+/// matching the APK's Home Layout picker.
+private struct LayoutPreviewCard: View {
+    @EnvironmentObject private var theme: ThemeManager
+    @Environment(\.isFocused) private var isFocused
+    let option: HomeLayout
+    let selected: Bool
+
+    var body: some View {
+        VStack(spacing: NuvioSpacing.sm) {
+            preview
+                .frame(height: 150)
+                .frame(maxWidth: .infinity)
+                .background(RoundedRectangle(cornerRadius: 10).fill(Color.black.opacity(0.4)))
+            HStack(spacing: 6) {
+                if selected {
+                    Image(systemName: "checkmark").font(.system(size: 18, weight: .bold))
+                        .foregroundStyle(theme.palette.secondary)
+                }
+                Text(option.displayName)
+                    .font(.system(size: 22, weight: .semibold))
+                    .foregroundStyle(theme.palette.textPrimary)
+            }
+        }
+        .padding(NuvioSpacing.md)
+        .frame(maxWidth: .infinity)
+        .background(
+            RoundedRectangle(cornerRadius: NuvioRadius.md, style: .continuous)
+                .fill(isFocused ? theme.palette.focusBackground : theme.palette.background.opacity(0.5))
+        )
+        .overlay(
+            RoundedRectangle(cornerRadius: NuvioRadius.md, style: .continuous)
+                .strokeBorder(isFocused ? theme.palette.focusRing
+                              : (selected ? theme.palette.secondary : .clear), lineWidth: isFocused ? 4 : 2)
+        )
+    }
+
+    private var bar: Color { theme.palette.textTertiary.opacity(0.5) }
+
+    @ViewBuilder
+    private var preview: some View {
+        switch option {
+        case .modern:
+            VStack(spacing: 6) {
+                RoundedRectangle(cornerRadius: 4).fill(bar).frame(height: 70)
+                HStack(spacing: 6) {
+                    ForEach(0..<3, id: \.self) { _ in RoundedRectangle(cornerRadius: 3).fill(bar).frame(height: 34) }
+                }
+            }
+            .padding(10)
+        case .grid:
+            VStack(spacing: 6) {
+                ForEach(0..<2, id: \.self) { _ in
+                    HStack(spacing: 6) {
+                        ForEach(0..<4, id: \.self) { _ in RoundedRectangle(cornerRadius: 3).fill(bar) }
+                    }
+                }
+            }
+            .padding(10)
+        case .classic:
+            VStack(spacing: 8) {
+                ForEach(0..<3, id: \.self) { _ in
+                    HStack(spacing: 6) {
+                        ForEach(0..<4, id: \.self) { _ in RoundedRectangle(cornerRadius: 3).fill(bar).frame(height: 28) }
+                    }
+                }
+            }
+            .padding(10)
+        }
+    }
+}
+
+private struct LayoutRowView: View {
+    @EnvironmentObject private var theme: ThemeManager
+
+    let row: LayoutRowInfo
+    let title: String
+    let isRenamed: Bool
+    let enabled: Bool
+    let onMoveUp: () -> Void
+    let onMoveDown: () -> Void
+    let onToggle: () -> Void
+    let onRename: () -> Void
+
+    var body: some View {
+        HStack(spacing: NuvioSpacing.lg) {
+            Image(systemName: row.isCollection ? "rectangle.stack.fill" : "square.grid.2x2.fill")
+                .font(.system(size: 22))
+                .foregroundStyle(enabled ? theme.palette.secondary : theme.palette.textTertiary)
+                .frame(width: 32)
+
+            VStack(alignment: .leading, spacing: 3) {
+                HStack(spacing: NuvioSpacing.sm) {
+                    Text(title)
+                        .font(.system(size: 24, weight: .medium))
+                        .foregroundStyle(enabled ? theme.palette.textPrimary : theme.palette.textTertiary)
+                        .lineLimit(1)
+                    if isRenamed {
+                        Image(systemName: "pencil")
+                            .font(.system(size: 16))
+                            .foregroundStyle(theme.palette.textTertiary)
+                    }
+                }
+                Text(row.subtitle)
+                    .font(.system(size: 18))
+                    .foregroundStyle(theme.palette.textTertiary)
+                    .lineLimit(1)
+            }
+
+            Spacer()
+
+            controlButton(icon: "chevron.up", action: onMoveUp)
+            controlButton(icon: "chevron.down", action: onMoveDown)
+            controlButton(icon: "pencil", action: onRename)
+            controlButton(icon: enabled ? "eye.fill" : "eye.slash.fill", action: onToggle)
+        }
+        .padding(.horizontal, NuvioSpacing.lg)
+        .frame(minHeight: 76)
+        .background(
+            RoundedRectangle(cornerRadius: NuvioRadius.md, style: .continuous)
+                .fill(theme.palette.backgroundCard.opacity(enabled ? 0.5 : 0.25))
+        )
+    }
+
+    private func controlButton(icon: String, action: @escaping () -> Void) -> some View {
+        Button(action: action) {
+            RowControlIcon(icon: icon)
+        }
+        .buttonStyle(PlainCardButtonStyle())
+    }
+}
+
+/// Small circular icon control (move/rename/hide) with the app's focus look.
+private struct RowControlIcon: View {
+    @EnvironmentObject private var theme: ThemeManager
+    @Environment(\.isFocused) private var isFocused
+
+    let icon: String
+
+    var body: some View {
+        Image(systemName: icon)
+            .font(.system(size: 20, weight: .semibold))
+            .foregroundStyle(isFocused ? theme.palette.onSecondary : theme.palette.textPrimary)
+            .frame(width: 56, height: 56)
+            .background(Circle().fill(isFocused ? theme.palette.secondary : Color.white.opacity(0.1)))
+            .overlay(Circle().strokeBorder(isFocused ? theme.palette.focusRing : .clear, lineWidth: 3))
+            .scaleEffect(isFocused ? 1.08 : 1)
+            .animation(.easeInOut(duration: 0.14), value: isFocused)
+    }
+}
+
+/// Simple rename entry cover (tvOS alerts can't host text fields).
+private struct RenameRowView: View {
+    @EnvironmentObject private var theme: ThemeManager
+    let title: String
+    @Binding var text: String
+    let onSave: () -> Void
+    let onClear: () -> Void
+    let onCancel: () -> Void
+
+    var body: some View {
+        ZStack {
+            theme.palette.background.ignoresSafeArea()
+            VStack(spacing: NuvioSpacing.xl) {
+                Text("Rename \"\(title)\"")
+                    .font(.system(size: 38, weight: .bold))
+                    .foregroundStyle(theme.palette.textPrimary)
+
+                TextField("Custom title", text: $text)
+                    .font(.system(size: 26))
+                    .frame(maxWidth: 700)
+
+                HStack(spacing: NuvioSpacing.lg) {
+                    Button("Save", action: onSave)
+                    Button("Use Default", action: onClear)
+                    Button("Cancel", role: .cancel, action: onCancel)
+                }
+                .font(.system(size: 24, weight: .semibold))
+            }
+            .padding(NuvioSpacing.huge)
+        }
+        .onExitCommand { onCancel() }
+    }
+}
+
+// MARK: - Collections pane
+
+/// Settings → Collections: create and edit collections (custom home rows of
+/// folders, each backed by addon catalog sources). Synced whole as a JSON
+/// blob via `sync_push_collections`.
+struct CollectionsSettingsDetail: View {
+    @EnvironmentObject private var theme: ThemeManager
+    @EnvironmentObject private var collections: CollectionsStore
+
+    @State private var editing: NuvioCollection?
+    @State private var creating = false
+
+    var body: some View {
+        DetailScaffold(title: "Collections", subtitle: "Group catalogs into custom home rows") {
+            Button { creating = true } label: {
+                SettingsActionRow(
+                    title: "New Collection",
+                    subtitle: "A custom home row of catalog folders",
+                    leadingIcon: "plus.circle.fill"
+                )
+            }
+            .buttonStyle(PlainCardButtonStyle())
+
+            ForEach(collections.collections) { collection in
+                Button { editing = collection } label: {
+                    SettingsActionRow(
+                        title: collection.title,
+                        subtitle: "\(collection.folders.count) folder\(collection.folders.count == 1 ? "" : "s")",
+                        leadingIcon: "rectangle.stack.fill"
+                    )
+                }
+                .buttonStyle(PlainCardButtonStyle())
+            }
+
+            if collections.collections.isEmpty {
+                Text("No collections yet. A collection appears as its own home row of folder tiles — like \"Marvel\" with folders for each phase.")
+                    .font(.system(size: 21))
+                    .foregroundStyle(theme.palette.textSecondary)
+                    .frame(maxWidth: 900, alignment: .leading)
+            }
+        }
+        .fullScreenCover(isPresented: $creating) {
+            CollectionEditorView(collection: nil) { creating = false }
+                .environmentObject(theme)
+                .environmentObject(collections)
+        }
+        .fullScreenCover(item: $editing) { collection in
+            CollectionEditorView(collection: collection) { editing = nil }
+                .environmentObject(theme)
+                .environmentObject(collections)
+        }
+    }
+}
+
+// MARK: - Collection editor
+
+/// Create/edit one collection: title, folders, and each folder's addon
+/// catalog sources (TMDB/Trakt sources need the #4 integrations; existing
+/// ones from other devices are preserved untouched).
+struct CollectionEditorView: View {
+    @EnvironmentObject private var theme: ThemeManager
+    @EnvironmentObject private var collections: CollectionsStore
+    @EnvironmentObject private var addonManager: AddonManager
+
+    let collection: NuvioCollection?
+    let onDone: () -> Void
+
+    @State private var title = ""
+    @State private var folders: [NuvioCollectionFolder] = []
+    @State private var editingFolder: NuvioCollectionFolder?
+    @State private var addingFolder = false
+
+    private var isNew: Bool { collection == nil }
+
+    var body: some View {
+        ZStack {
+            theme.palette.background.ignoresSafeArea()
+            ScrollView(.vertical) {
+                VStack(alignment: .leading, spacing: NuvioSpacing.xl) {
+                    Text(isNew ? "New Collection" : "Edit Collection")
+                        .font(.system(size: 40, weight: .bold))
+                        .foregroundStyle(theme.palette.textPrimary)
+
+                    TextField("Collection name", text: $title)
+                        .font(.system(size: 26))
+                        .frame(maxWidth: 700)
+
+                    Text("Folders")
+                        .font(.system(size: 28, weight: .bold))
+                        .foregroundStyle(theme.palette.textPrimary)
+
+                    Button { addingFolder = true } label: {
+                        SettingsActionRow(
+                            title: "Add Folder",
+                            subtitle: "Pick catalogs to fill it",
+                            leadingIcon: "folder.badge.plus"
+                        )
+                    }
+                    .buttonStyle(PlainCardButtonStyle())
+
+                    ForEach(folders) { folder in
+                        HStack(spacing: NuvioSpacing.md) {
+                            Button { editingFolder = folder } label: {
+                                SettingsActionRow(
+                                    title: folder.title.isEmpty ? "Untitled folder" : folder.title,
+                                    subtitle: folderSubtitle(folder),
+                                    leadingIcon: "folder.fill"
+                                )
+                            }
+                            .buttonStyle(PlainCardButtonStyle())
+                            Button(role: .destructive) {
+                                folders.removeAll { $0.id == folder.id }
+                            } label: {
+                                Image(systemName: "trash").font(.system(size: 22))
+                            }
+                        }
+                    }
+
+                    HStack(spacing: NuvioSpacing.lg) {
+                        Button("Save", action: save)
+                            .disabled(title.trimmingCharacters(in: .whitespaces).isEmpty)
+                        if !isNew {
+                            Button("Delete Collection", role: .destructive) {
+                                if let collection { collections.remove(id: collection.id) }
+                                onDone()
+                            }
+                        }
+                        Button("Cancel", role: .cancel, action: onDone)
+                    }
+                    .font(.system(size: 24, weight: .semibold))
+                    .padding(.top, NuvioSpacing.lg)
+                }
+                .padding(NuvioSpacing.huge)
+                .frame(maxWidth: .infinity, alignment: .leading)
+            }
+            .scrollClipDisabled()
+        }
+        .onAppear {
+            if let collection {
+                title = collection.title
+                folders = collection.folders
+            }
+        }
+        // Same as Cancel — dismiss without saving.
+        .onExitCommand { onDone() }
+        .fullScreenCover(isPresented: $addingFolder) {
+            FolderEditorView(folder: nil) { newFolder in
+                if let newFolder { folders.append(newFolder) }
+                addingFolder = false
+            }
+            .environmentObject(theme)
+            .environmentObject(addonManager)
+        }
+        .fullScreenCover(item: $editingFolder) { folder in
+            FolderEditorView(folder: folder) { updated in
+                if let updated, let index = folders.firstIndex(where: { $0.id == updated.id }) {
+                    folders[index] = updated
+                }
+                editingFolder = nil
+            }
+            .environmentObject(theme)
+            .environmentObject(addonManager)
+        }
+    }
+
+    private func folderSubtitle(_ folder: NuvioCollectionFolder) -> String {
+        let addonCount = folder.addonSources.count
+        let otherCount = folder.effectiveSources.count - addonCount
+        var parts: [String] = ["\(addonCount) catalog\(addonCount == 1 ? "" : "s")"]
+        if otherCount > 0 { parts.append("\(otherCount) TMDB/Trakt (needs integrations)") }
+        return parts.joined(separator: " · ")
+    }
+
+    private func save() {
+        let trimmed = title.trimmingCharacters(in: .whitespaces)
+        guard !trimmed.isEmpty else { return }
+        if var existing = collection {
+            existing.title = trimmed
+            existing.folders = folders
+            collections.update(existing)
+        } else {
+            var created = NuvioCollection(id: collections.generateID(), title: trimmed, folders: folders)
+            created.folders = folders
+            collections.add(created)
+        }
+        onDone()
+    }
+}
+
+// MARK: - Folder editor
+
+/// Edit one folder: name and which installed addon catalogs feed it.
+private struct FolderEditorView: View {
+    @EnvironmentObject private var theme: ThemeManager
+    @EnvironmentObject private var addonManager: AddonManager
+
+    let folder: NuvioCollectionFolder?
+    let onDone: (NuvioCollectionFolder?) -> Void
+
+    @State private var title = ""
+    @State private var selectedSources: Set<String> = []
+    /// Non-addon sources carried through untouched (TMDB/Trakt from Android).
+    @State private var passthroughSources: [CollectionSourceDTO] = []
+
+    private struct CatalogChoice: Identifiable {
+        let source: CollectionSourceDTO
+        let label: String
+        let addonName: String
+        var id: String { "\(source.addonId ?? "")|\(source.type ?? "")|\(source.catalogId ?? "")" }
+    }
+
+    private var choices: [CatalogChoice] {
+        addonManager.catalogAddons.flatMap { addon in
+            (addon.manifest.catalogs ?? [])
+                .filter { !$0.requiresExtra }
+                .map { catalog in
+                    CatalogChoice(
+                        source: CollectionSourceDTO(
+                            addonId: addon.manifest.id,
+                            type: catalog.type,
+                            catalogId: catalog.id
+                        ),
+                        label: catalog.displayName,
+                        addonName: addon.manifest.name
+                    )
+                }
+        }
+    }
+
+    var body: some View {
+        ZStack {
+            theme.palette.background.ignoresSafeArea()
+            ScrollView(.vertical) {
+                VStack(alignment: .leading, spacing: NuvioSpacing.xl) {
+                    Text(folder == nil ? "New Folder" : "Edit Folder")
+                        .font(.system(size: 40, weight: .bold))
+                        .foregroundStyle(theme.palette.textPrimary)
+
+                    TextField("Folder name", text: $title)
+                        .font(.system(size: 26))
+                        .frame(maxWidth: 700)
+
+                    Text("Catalog Sources")
+                        .font(.system(size: 28, weight: .bold))
+                        .foregroundStyle(theme.palette.textPrimary)
+
+                    ForEach(choices) { choice in
+                        Button {
+                            if selectedSources.contains(choice.id) {
+                                selectedSources.remove(choice.id)
+                            } else {
+                                selectedSources.insert(choice.id)
+                            }
+                        } label: {
+                            HStack(spacing: NuvioSpacing.lg) {
+                                Image(systemName: selectedSources.contains(choice.id)
+                                      ? "checkmark.circle.fill" : "circle")
+                                    .font(.system(size: 26))
+                                    .foregroundStyle(selectedSources.contains(choice.id)
+                                                     ? theme.palette.secondary : theme.palette.textTertiary)
+                                VStack(alignment: .leading, spacing: 2) {
+                                    Text(choice.label)
+                                        .font(.system(size: 24, weight: .medium))
+                                        .foregroundStyle(theme.palette.textPrimary)
+                                    Text(choice.addonName)
+                                        .font(.system(size: 18))
+                                        .foregroundStyle(theme.palette.textTertiary)
+                                }
+                                Spacer()
+                            }
+                            .padding(.horizontal, NuvioSpacing.lg)
+                            .frame(minHeight: 70)
+                            .frame(maxWidth: 900)
+                            .background(
+                                RoundedRectangle(cornerRadius: NuvioRadius.md, style: .continuous)
+                                    .fill(theme.palette.backgroundCard.opacity(0.5))
+                            )
+                        }
+                        .buttonStyle(PlainCardButtonStyle())
+                    }
+
+                    if !passthroughSources.isEmpty {
+                        Text("\(passthroughSources.count) TMDB/Trakt source\(passthroughSources.count == 1 ? "" : "s") from another device kept as-is (they need the TMDB/Trakt integrations).")
+                            .font(.system(size: 19))
+                            .foregroundStyle(theme.palette.textSecondary)
+                            .frame(maxWidth: 900, alignment: .leading)
+                    }
+
+                    HStack(spacing: NuvioSpacing.lg) {
+                        Button("Save", action: save)
+                            .disabled(title.trimmingCharacters(in: .whitespaces).isEmpty)
+                        Button("Cancel", role: .cancel) { onDone(nil) }
+                    }
+                    .font(.system(size: 24, weight: .semibold))
+                    .padding(.top, NuvioSpacing.lg)
+                }
+                .padding(NuvioSpacing.huge)
+                .frame(maxWidth: .infinity, alignment: .leading)
+            }
+            .scrollClipDisabled()
+        }
+        .onAppear {
+            guard let folder else { return }
+            title = folder.title
+            passthroughSources = folder.effectiveSources.filter { !$0.isAddonSource }
+            selectedSources = Set(folder.addonSources.map {
+                "\($0.addonId ?? "")|\($0.type ?? "")|\($0.catalogId ?? "")"
+            })
+        }
+        // Same as Cancel — dismiss without saving.
+        .onExitCommand { onDone(nil) }
+    }
+
+    private func save() {
+        let trimmed = title.trimmingCharacters(in: .whitespaces)
+        guard !trimmed.isEmpty else { return }
+        let picked = choices.filter { selectedSources.contains($0.id) }.map(\.source)
+        var result = folder ?? NuvioCollectionFolder(id: UUID().uuidString, title: trimmed, sources: [])
+        result.title = trimmed
+        result.sources = picked + passthroughSources
+        result.catalogSources = picked
+        onDone(result)
+    }
+}
