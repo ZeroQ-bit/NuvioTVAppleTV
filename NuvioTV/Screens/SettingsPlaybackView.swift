@@ -75,6 +75,13 @@ struct PlaybackSettingsDetail: View {
                 ) { store.settings.playerEngine = PlayerEngine(rawValue: $0) ?? .auto }
 
                 PlaybackToggleRow(
+                    icon: "sparkles.tv.fill",
+                    title: "Native Dolby Vision",
+                    subtitle: "Play Dolby Vision files (profile 5/8) through Apple's video pipeline for true dynamic DV on DV-capable TVs. Remuxes on-device; falls back to the standard HDR10 engine automatically if anything fails. Off = always use the standard engine.",
+                    isOn: s.nativeDolbyVision
+                )
+
+                PlaybackToggleRow(
                     icon: "tv.fill",
                     title: "Match content display mode",
                     subtitle: "Switch the TV into the video's HDR mode for native Dolby Vision/HDR. Uses the gentlest switch possible (dynamic range only, no refresh-rate change) to reduce grey-screen risk — but some TVs still mis-handshake and stick on grey until power-cycled, so leave off if that happens. Off = tone-map into the home screen's format (like Stremio).",

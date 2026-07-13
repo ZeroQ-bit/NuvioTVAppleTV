@@ -1,0 +1,487 @@
+import Foundation
+import KSPlayer
+import Libavcodec
+import Libavformat
+import Libavutil
+
+/// On-device Dolby Vision remux server.
+///
+/// tvOS only outputs true (dynamic-metadata) Dolby Vision when a DV-tagged
+/// compressed stream reaches Apple's own video pipeline — anything FFmpeg
+/// decodes to pixels has already lost the RPU. So for a DV file this class
+/// remuxes (stream copy, no re-encode) the source's HEVC+audio into a LOCAL
+/// fMP4 HLS event playlist that AVPlayer plays natively:
+///
+///   http(s) MKV ──libavformat──▶ mp4 muxer (fragmented, DV-tagged)
+///        │                          │ custom AVIO write callback
+///        ▼                          ▼
+///   packets (copied)       top-level box splitter
+///                          ftyp+moov → init.mp4
+///                          each moof+mdat → segNNNNN.m4s
+///                          hand-written dv.m3u8 (EVENT, EXT-X-MAP)
+///
+/// This build's FFmpeg has no `hls` muxer, hence the manual splitter — the
+/// mp4 muxer in `frag_keyframe+empty_moov+default_base_moof` mode emits
+/// exactly the boxes fMP4 HLS needs, and movenc writes the `dvcC`/`dvvC`
+/// configuration box from the stream's DOVI side data (verified present in
+/// the shipped Libavformat).
+///
+/// Eligibility (checked on open): HEVC video with DOVI config, profile 5 or 8
+/// (Apple never accepts profile 7), and at least one AVPlayer-compatible
+/// audio track (E-AC3 / AC3 / AAC — TrueHD/DTS can't ride HLS). Anything else
+/// reports `onIneligible` and the caller stays on the FFmpeg engine.
+///
+/// All callbacks are delivered on the main queue.
+final class DVRemuxer {
+    // MARK: Public surface
+
+    /// Fires once the playlist is playable (a few segments written, or the
+    /// whole file finished early). `actualStart` = the absolute source time
+    /// (seconds) that playlist t=0 corresponds to.
+    var onReady: ((URL, Double) -> Void)?
+    /// Seconds of content (relative to actualStart) written so far.
+    var onProgress: ((Double) -> Void)?
+    /// The whole file has been remuxed; playlist got EXT-X-ENDLIST.
+    var onFinished: (() -> Void)?
+    /// The source can't take this path (wrong profile / no compatible audio).
+    var onIneligible: ((String) -> Void)?
+    /// Hard failure mid-flight.
+    var onError: ((String) -> Void)?
+
+    let directory: URL
+    private let inputURLString: String
+    private let startAtSeconds: Double
+    private let preferredAudioLanguage: String
+
+    init(input: String, startAt: Double, preferredAudioLanguage: String = "") {
+        inputURLString = input
+        startAtSeconds = max(startAt, 0)
+        self.preferredAudioLanguage = preferredAudioLanguage
+        directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("dv-remux-\(UUID().uuidString)", isDirectory: true)
+    }
+
+    func start() {
+        let thread = Thread { [self] in run() }
+        thread.name = "DVRemuxer"
+        thread.qualityOfService = .userInitiated
+        thread.start()
+    }
+
+    /// Thread-safe: flips the flag the AVIO interrupt callback polls, so even
+    /// a blocked network read bails out promptly.
+    func cancel() {
+        cancelled = true
+    }
+
+    /// Remove the segment directory (call after the player has moved off it).
+    func cleanup() {
+        try? FileManager.default.removeItem(at: directory)
+    }
+
+    // MARK: State (remux thread unless noted)
+
+    @Atomic private var cancelled = false
+    private var readySignalled = false
+    private var finished = false
+
+    // Timeline bookkeeping (seconds, source timeline)
+    private var firstWrittenPTS: Double = .nan
+    private var lastVideoPTS: Double = 0
+    /// Video keyframe times relative to firstWrittenPTS — fragment boundaries
+    /// (frag_keyframe = one fragment per GOP), used for exact EXTINF values.
+    private var keyframes: [Double] = []
+
+    // Playlist bookkeeping
+    private var segmentDurations: [Double] = []
+    private var playlistURL: URL { directory.appendingPathComponent("dv.m3u8") }
+
+    // Box splitter state
+    private var pendingBytes = Data()
+    private var initPhase = true
+    private var initData = Data()
+    private var segmentData = Data()
+    private var segmentOpen = false
+    private var segmentIndex = 0
+
+    // MARK: - Remux thread
+
+    private func run() {
+        do {
+            try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        } catch {
+            report { self.onError?("Couldn't create segment directory") }
+            return
+        }
+
+        var ictx: UnsafeMutablePointer<AVFormatContext>?
+        var octx: UnsafeMutablePointer<AVFormatContext>?
+        var avioCtx: UnsafeMutablePointer<AVIOContext>?
+        defer {
+            if octx != nil {
+                if let pb = octx?.pointee.pb { av_free(pb.pointee.buffer) }
+                avformat_free_context(octx)
+            }
+            if avioCtx != nil { avio_context_free(&avioCtx) }
+            avformat_close_input(&ictx)
+        }
+
+        // ---- Open input (same network posture as the player) ----
+        ictx = avformat_alloc_context()
+        guard let inCtx = ictx else { report { self.onError?("alloc failed") }; return }
+        var interruptCB = AVIOInterruptCB()
+        interruptCB.opaque = Unmanaged.passUnretained(self).toOpaque()
+        interruptCB.callback = { opaque -> Int32 in
+            guard let opaque else { return 0 }
+            return Unmanaged<DVRemuxer>.fromOpaque(opaque).takeUnretainedValue().cancelled ? 1 : 0
+        }
+        inCtx.pointee.interrupt_callback = interruptCB
+
+        var openOpts: OpaquePointer?
+        av_dict_set(&openOpts, "reconnect", "1", 0)
+        av_dict_set(&openOpts, "reconnect_streamed", "1", 0)
+        av_dict_set(&openOpts, "reconnect_delay_max", "5", 0)
+        av_dict_set(&openOpts, "reconnect_on_network_error", "1", 0)
+        av_dict_set(&openOpts, "rw_timeout", "20000000", 0)
+        av_dict_set(&openOpts, "buffer_size", String(4 << 20), 0)
+        var openResult = avformat_open_input(&ictx, inputURLString, nil, &openOpts)
+        av_dict_free(&openOpts)
+        guard openResult == 0, ictx != nil else {
+            report { self.onError?("Couldn't open source (\(openResult))") }
+            return
+        }
+        openResult = avformat_find_stream_info(ictx, nil)
+        guard openResult >= 0 else {
+            report { self.onError?("Couldn't probe source (\(openResult))") }
+            return
+        }
+
+        // ---- Eligibility: DV P5/P8 video + AVPlayer-compatible audio ----
+        var videoIndex: Int32 = -1
+        var dvProfile: UInt8 = 0
+        var audioIndex: Int32 = -1
+        var audioScore = -1
+
+        let streamCount = Int(ictx!.pointee.nb_streams)
+        for i in 0 ..< streamCount {
+            guard let stream = ictx!.pointee.streams[i], let par = stream.pointee.codecpar else { continue }
+            let isAttachedPic = (stream.pointee.disposition & AV_DISPOSITION_ATTACHED_PIC) != 0
+            if par.pointee.codec_type == AVMEDIA_TYPE_VIDEO, !isAttachedPic, videoIndex < 0 {
+                guard par.pointee.codec_id == AV_CODEC_ID_HEVC else { continue }
+                var sideSize = 0
+                if let side = av_stream_get_side_data(stream, AV_PKT_DATA_DOVI_CONF, &sideSize), sideSize > 0 {
+                    let record = side.withMemoryRebound(to: DOVIDecoderConfigurationRecord.self, capacity: 1) { $0.pointee }
+                    dvProfile = record.dv_profile
+                    videoIndex = Int32(i)
+                }
+            } else if par.pointee.codec_type == AVMEDIA_TYPE_AUDIO {
+                // Priority: E-AC3 (Atmos-capable) > AC3 > AAC.
+                let score: Int
+                switch par.pointee.codec_id {
+                case AV_CODEC_ID_EAC3: score = 3
+                case AV_CODEC_ID_AC3: score = 2
+                case AV_CODEC_ID_AAC: score = 1
+                default: score = -1
+                }
+                guard score > 0 else { continue }
+                // Preferred language wins ties (worth +½ tier).
+                var langBonus = 0
+                if !preferredAudioLanguage.isEmpty,
+                   let langEntry = av_dict_get(stream.pointee.metadata, "language", nil, 0),
+                   let value = langEntry.pointee.value,
+                   String(cString: value).hasPrefix(preferredAudioLanguage) {
+                    langBonus = 10
+                }
+                if score + langBonus > audioScore {
+                    audioScore = score + langBonus
+                    audioIndex = Int32(i)
+                }
+            }
+        }
+
+        guard videoIndex >= 0 else {
+            report { self.onIneligible?("no Dolby Vision video stream") }
+            return
+        }
+        guard dvProfile == 5 || dvProfile == 8 else {
+            report { self.onIneligible?("Dolby Vision profile \(dvProfile) (only 5/8 supported)") }
+            return
+        }
+        guard audioIndex >= 0 else {
+            report { self.onIneligible?("no E-AC3/AC3/AAC audio track (TrueHD/DTS can't ride the native pipeline)") }
+            return
+        }
+
+        // ---- Input seek (resume mid-movie without remuxing from zero) ----
+        if startAtSeconds > 1 {
+            let ts = Int64(startAtSeconds * 1_000_000)   // AV_TIME_BASE units
+            av_seek_frame(ictx, -1, ts, 1 /* AVSEEK_FLAG_BACKWARD */)
+        }
+
+        // ---- Output: fragmented MP4 through the box splitter ----
+        avformat_alloc_output_context2(&octx, nil, "mp4", nil)
+        guard let outCtx = octx else { report { self.onError?("mp4 muxer unavailable") }; return }
+        outCtx.pointee.strict_std_compliance = -2   // experimental: DV tags
+        outCtx.pointee.avoid_negative_ts = 2        // MAKE_ZERO: playlist t=0
+
+        let ioBufSize: Int32 = 1 << 16
+        guard let ioBuf = av_malloc(Int(ioBufSize))?.assumingMemoryBound(to: UInt8.self) else {
+            report { self.onError?("io alloc failed") }; return
+        }
+        avioCtx = avio_alloc_context(
+            ioBuf, ioBufSize, 1,
+            Unmanaged.passUnretained(self).toOpaque(), nil,
+            { opaque, data, size -> Int32 in
+                guard let opaque, let data, size > 0 else { return size }
+                let remuxer = Unmanaged<DVRemuxer>.fromOpaque(opaque).takeUnretainedValue()
+                remuxer.consume(Data(bytes: data, count: Int(size)))
+                return size
+            }, nil
+        )
+        guard avioCtx != nil else { report { self.onError?("avio alloc failed") }; return }
+        avioCtx!.pointee.seekable = 0
+        outCtx.pointee.pb = avioCtx
+
+        guard let inVideo = ictx!.pointee.streams[Int(videoIndex)],
+              let inAudio = ictx!.pointee.streams[Int(audioIndex)],
+              let outVideo = avformat_new_stream(outCtx, nil),
+              let outAudio = avformat_new_stream(outCtx, nil)
+        else { report { self.onError?("stream setup failed") }; return }
+
+        avcodec_parameters_copy(outVideo.pointee.codecpar, inVideo.pointee.codecpar)
+        avcodec_parameters_copy(outAudio.pointee.codecpar, inAudio.pointee.codecpar)
+        outAudio.pointee.codecpar.pointee.codec_tag = 0
+        // Sample entry: P5 has no cross-compatible base layer → dvh1 (DV-only
+        // brand). P8 is HDR10-backward-compatible → hvc1, movenc adds dvvC.
+        outVideo.pointee.codecpar.pointee.codec_tag = dvProfile == 5
+            ? fourCC("d", "v", "h", "1")
+            : fourCC("h", "v", "c", "1")
+
+        // movenc reads DV config (and HDR mastering metadata for the fallback
+        // path) from STREAM side data, which parameters_copy doesn't carry.
+        copyStreamSideData(from: inVideo, to: outVideo, type: AV_PKT_DATA_DOVI_CONF)
+        copyStreamSideData(from: inVideo, to: outVideo, type: AV_PKT_DATA_MASTERING_DISPLAY_METADATA)
+        copyStreamSideData(from: inVideo, to: outVideo, type: AV_PKT_DATA_CONTENT_LIGHT_LEVEL)
+
+        var muxOpts: OpaquePointer?
+        av_dict_set(&muxOpts, "movflags", "+frag_keyframe+empty_moov+default_base_moof", 0)
+        var writeResult = avformat_write_header(octx, &muxOpts)
+        av_dict_free(&muxOpts)
+        guard writeResult >= 0 else {
+            report { self.onError?("mux header failed (\(writeResult))") }
+            return
+        }
+
+        // ---- Copy loop ----
+        guard let packet = av_packet_alloc() else { report { self.onError?("packet alloc failed") }; return }
+        var freePacket: UnsafeMutablePointer<AVPacket>? = packet
+        defer { av_packet_free(&freePacket) }
+
+        let inVideoTB = inVideo.pointee.time_base
+        let inAudioTB = inAudio.pointee.time_base
+        var packetsSinceProgress = 0
+
+        while !cancelled {
+            let readResult = av_read_frame(ictx, packet)
+            if readResult < 0 { break }   // EOF or error → finalize what we have
+            defer { av_packet_unref(packet) }
+
+            let streamIndex = packet.pointee.stream_index
+            let isVideo = streamIndex == videoIndex
+            let isAudio = streamIndex == audioIndex
+            guard isVideo || isAudio else { continue }
+
+            let inTB = isVideo ? inVideoTB : inAudioTB
+            if packet.pointee.pts != Int64.min {   // AV_NOPTS_VALUE
+                let ptsSec = Double(packet.pointee.pts) * av_q2d(inTB)
+                if firstWrittenPTS.isNaN { firstWrittenPTS = ptsSec }
+                if isVideo {
+                    lastVideoPTS = ptsSec
+                    if (packet.pointee.flags & 0x0001) != 0 {   // AV_PKT_FLAG_KEY
+                        keyframes.append(ptsSec - firstWrittenPTS)
+                    }
+                }
+            }
+
+            let outStream = isVideo ? outVideo : outAudio
+            packet.pointee.stream_index = outStream.pointee.index
+            av_packet_rescale_ts(packet, inTB, outStream.pointee.time_base)
+            packet.pointee.pos = -1
+
+            writeResult = av_interleaved_write_frame(octx, packet)
+            if writeResult < 0 {
+                report { self.onError?("mux write failed (\(writeResult))") }
+                return
+            }
+
+            packetsSinceProgress += 1
+            if packetsSinceProgress >= 100 {
+                packetsSinceProgress = 0
+                let written = max(lastVideoPTS - (firstWrittenPTS.isNaN ? 0 : firstWrittenPTS), 0)
+                report { self.onProgress?(written) }
+            }
+        }
+
+        if cancelled { return }
+
+        // Flush the final fragment + finalize the playlist.
+        av_write_trailer(octx)
+        finished = true
+        finalizeOpenSegment()
+        writePlaylist(ended: true)
+        let written = max(lastVideoPTS - (firstWrittenPTS.isNaN ? 0 : firstWrittenPTS), 0)
+        signalReadyIfNeeded()
+        report {
+            self.onProgress?(written)
+            self.onFinished?()
+        }
+    }
+
+    // MARK: - Box splitter (called from the AVIO write callback, remux thread)
+
+    /// mp4 muxer output arrives as an arbitrary byte stream; carve it into
+    /// top-level ISO-BMFF boxes. ftyp+moov (everything before the first moof)
+    /// is the HLS init segment; each moof…mdat run is one media segment.
+    private func consume(_ bytes: Data) {
+        pendingBytes.append(bytes)
+        while pendingBytes.count >= 8 {
+            let declared = pendingBytes.withUnsafeBytes { raw -> UInt64 in
+                let size32 = UInt32(bigEndian: raw.loadUnaligned(fromByteOffset: 0, as: UInt32.self))
+                if size32 == 1, raw.count >= 16 {
+                    return UInt64(bigEndian: raw.loadUnaligned(fromByteOffset: 8, as: UInt64.self))
+                }
+                return UInt64(size32)
+            }
+            guard declared >= 8, declared < 1 << 32 else { return }   // malformed: bail
+            let boxSize = Int(declared)
+            guard pendingBytes.count >= boxSize else { return }       // wait for more
+            let box = pendingBytes.prefix(boxSize)
+            let type = String(decoding: box.dropFirst(4).prefix(4), as: UTF8.self)
+            pendingBytes.removeFirst(boxSize)
+            dispatch(box: Data(box), type: type)
+        }
+    }
+
+    private func dispatch(box: Data, type: String) {
+        if initPhase {
+            if type == "moof" {
+                // Init segment complete — write it, open the first segment.
+                try? initData.write(to: directory.appendingPathComponent("init.mp4"))
+                initPhase = false
+                segmentData = box
+                segmentOpen = true
+            } else {
+                initData.append(box)
+            }
+            return
+        }
+        if !segmentOpen {
+            guard type == "moof" else { return }   // mfra / trailer noise
+            segmentData = box
+            segmentOpen = true
+            return
+        }
+        segmentData.append(box)
+        if type == "mdat" { closeSegment() }
+    }
+
+    private func closeSegment() {
+        let name = String(format: "seg%05d.m4s", segmentIndex)
+        try? segmentData.write(to: directory.appendingPathComponent(name))
+        segmentData = Data()
+        segmentOpen = false
+
+        // Fragment i spans keyframe i → i+1 (frag_keyframe = one per GOP); the
+        // next keyframe is always recorded before movenc flushes fragment i.
+        let duration: Double
+        if segmentIndex + 1 < keyframes.count {
+            duration = max(keyframes[segmentIndex + 1] - keyframes[segmentIndex], 0.04)
+        } else {
+            let base = keyframes.indices.contains(segmentIndex) ? keyframes[segmentIndex] : 0
+            duration = max(lastVideoPTS - (firstWrittenPTS.isNaN ? 0 : firstWrittenPTS) - base + 0.04, 0.04)
+        }
+        segmentDurations.append(duration)
+        segmentIndex += 1
+
+        writePlaylist(ended: false)
+        if segmentIndex >= 3 { signalReadyIfNeeded() }
+        let available = keyframes.indices.contains(segmentIndex) ? keyframes[segmentIndex]
+            : max(lastVideoPTS - (firstWrittenPTS.isNaN ? 0 : firstWrittenPTS), 0)
+        report { self.onProgress?(available) }
+    }
+
+    /// Trailer can flush a final moof+mdat through the normal path; anything
+    /// left half-open (shouldn't happen) is dropped.
+    private func finalizeOpenSegment() {
+        segmentData = Data()
+        segmentOpen = false
+    }
+
+    // MARK: - Playlist
+
+    private func writePlaylist(ended: Bool) {
+        var lines = [
+            "#EXTM3U",
+            "#EXT-X-VERSION:7",
+            "#EXT-X-TARGETDURATION:\(Int((segmentDurations.max() ?? 6).rounded(.up)) + 1)",
+            "#EXT-X-MEDIA-SEQUENCE:0",
+            "#EXT-X-PLAYLIST-TYPE:\(ended ? "VOD" : "EVENT")",
+            "#EXT-X-INDEPENDENT-SEGMENTS",
+            "#EXT-X-MAP:URI=\"init.mp4\"",
+        ]
+        for (i, duration) in segmentDurations.enumerated() {
+            lines.append(String(format: "#EXTINF:%.5f,", duration))
+            lines.append(String(format: "seg%05d.m4s", i))
+        }
+        if ended { lines.append("#EXT-X-ENDLIST") }
+        let content = lines.joined(separator: "\n") + "\n"
+        // Atomic: AVPlayer polls the EVENT playlist — it must never read half.
+        try? content.data(using: .utf8)?.write(to: playlistURL, options: .atomic)
+    }
+
+    private func signalReadyIfNeeded() {
+        guard !readySignalled, segmentIndex > 0 else { return }
+        readySignalled = true
+        let start = firstWrittenPTS.isNaN ? startAtSeconds : firstWrittenPTS
+        let url = playlistURL
+        report { self.onReady?(url, start) }
+    }
+
+    // MARK: - Helpers
+
+    private func report(_ block: @escaping () -> Void) {
+        DispatchQueue.main.async { [self] in
+            guard !cancelled else { return }
+            _ = self   // keep alive through delivery
+            block()
+        }
+    }
+
+    private func fourCC(_ a: Character, _ b: Character, _ c: Character, _ d: Character) -> UInt32 {
+        UInt32(a.asciiValue!) | UInt32(b.asciiValue!) << 8 | UInt32(c.asciiValue!) << 16 | UInt32(d.asciiValue!) << 24
+    }
+
+    private func copyStreamSideData(
+        from inStream: UnsafeMutablePointer<AVStream>,
+        to outStream: UnsafeMutablePointer<AVStream>,
+        type: AVPacketSideDataType
+    ) {
+        var size = 0
+        guard let src = av_stream_get_side_data(inStream, type, &size), size > 0,
+              let dst = av_stream_new_side_data(outStream, type, size)
+        else { return }
+        memcpy(dst, src, size)
+    }
+}
+
+/// Minimal atomic bool (the remux thread + main thread both touch `cancelled`).
+@propertyWrapper
+final class Atomic<Value> {
+    private let lock = NSLock()
+    private var value: Value
+    init(wrappedValue: Value) { value = wrappedValue }
+    var wrappedValue: Value {
+        get { lock.lock(); defer { lock.unlock() }; return value }
+        set { lock.lock(); defer { lock.unlock() }; value = newValue }
+    }
+}

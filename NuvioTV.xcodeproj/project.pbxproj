@@ -57,6 +57,7 @@
 		BAFA27E5E9E52210E0D89DA5 /* AccountView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4581D56301494EB1525328EA /* AccountView.swift */; };
 		BF6961891F5345E7DBE28277 /* Components.swift in Sources */ = {isa = PBXBuildFile; fileRef = 49BAA0E54FBA5A8CFE9473FA /* Components.swift */; };
 		C4A89B31BA169E57A828C8A5 /* PlayerControlsOverlay.swift in Sources */ = {isa = PBXBuildFile; fileRef = 57C4A723527A06C009FCB68A /* PlayerControlsOverlay.swift */; };
+		C7A329FA86460E8FE3DFCA59 /* DVRemuxer.swift in Sources */ = {isa = PBXBuildFile; fileRef = 48D4225F2EA78DACA1350421 /* DVRemuxer.swift */; };
 		CB4FE6DE4F4A2038847E8042 /* KSPlayer in Frameworks */ = {isa = PBXBuildFile; productRef = 6F247E3DA7201162C0D31072 /* KSPlayer */; };
 		CC4A6D4DD45D75EFED96839E /* Models.swift in Sources */ = {isa = PBXBuildFile; fileRef = 79E6F3DF03C6701BE4587833 /* Models.swift */; };
 		D31767F9B2A2591C6DF38322 /* NuvioAccountManager.swift in Sources */ = {isa = PBXBuildFile; fileRef = E88E24392958CAE9EB4727EE /* NuvioAccountManager.swift */; };
@@ -87,6 +88,7 @@
 		414898F11CD091C483A70A67 /* MDBListService.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MDBListService.swift; sourceTree = "<group>"; };
 		44180118E0397498DE32CF39 /* NuvioDropdown.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = NuvioDropdown.swift; sourceTree = "<group>"; };
 		4581D56301494EB1525328EA /* AccountView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AccountView.swift; sourceTree = "<group>"; };
+		48D4225F2EA78DACA1350421 /* DVRemuxer.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DVRemuxer.swift; sourceTree = "<group>"; };
 		49BAA0E54FBA5A8CFE9473FA /* Components.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Components.swift; sourceTree = "<group>"; };
 		4C01CCB128223FD098404765 /* DiscoverView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DiscoverView.swift; sourceTree = "<group>"; };
 		4D4C53D8C6A8B8FC9F1C1216 /* SourceSelection.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SourceSelection.swift; sourceTree = "<group>"; };
@@ -235,6 +237,7 @@
 		D68D84295084526EF7FBE853 /* Player */ = {
 			isa = PBXGroup;
 			children = (
+				48D4225F2EA78DACA1350421 /* DVRemuxer.swift */,
 				E2B5622602D0586649B04485 /* PauseOverlayView.swift */,
 				57C4A723527A06C009FCB68A /* PlayerControlsOverlay.swift */,
 				75C74274D8317A3EC634F256 /* PlayerScreen.swift */,
@@ -378,6 +381,7 @@
 				AE0CFA7CB5922AEB4625975A /* CollectionView.swift in Sources */,
 				2072F1BAB7047F8207172DA4 /* CollectionsStore.swift in Sources */,
 				BF6961891F5345E7DBE28277 /* Components.swift in Sources */,
+				C7A329FA86460E8FE3DFCA59 /* DVRemuxer.swift in Sources */,
 				0DFE89CB6E0C80C4497E341F /* DebridService.swift in Sources */,
 				E5B79A409AAB47A1AC1155D8 /* DetailView.swift in Sources */,
 				8D638E0114249DD36A1B140E /* DiscoverView.swift in Sources */,

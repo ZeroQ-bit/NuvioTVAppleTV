@@ -124,6 +124,13 @@ struct PlayerSettings: Codable, Equatable {
     /// content's native mode — some TVs mis-handshake the switch back and
     /// wedge on a grey screen until power-cycled, hence the default.
     var matchContentDisplayMode: Bool = false
+    /// Native Dolby Vision output (experimental). When a Dolby Vision file
+    /// (profile 5/8) plays on a DV-capable TV, the stream is remuxed on-device
+    /// into a DV-tagged fMP4 playlist and handed to Apple's video pipeline —
+    /// true dynamic DV instead of the HDR10 tone-map. Any failure falls back
+    /// to the standard engine automatically. Off = always use the standard
+    /// HDR10 path.
+    var nativeDolbyVision: Bool = true
 
     /// Selectable subtitle sizes.
     static let subtitleSizeValues: [Int] = [28, 32, 36, 42, 48, 56]
@@ -197,6 +204,7 @@ struct PlayerSettings: Codable, Equatable {
         sourcesLowGBPerTier = (try? c.decode(Int.self, forKey: .sourcesLowGBPerTier)) ?? d.sourcesLowGBPerTier
         sourcesPerSizeTier = (try? c.decode(Int.self, forKey: .sourcesPerSizeTier)) ?? d.sourcesPerSizeTier
         matchContentDisplayMode = (try? c.decode(Bool.self, forKey: .matchContentDisplayMode)) ?? d.matchContentDisplayMode
+        nativeDolbyVision = (try? c.decode(Bool.self, forKey: .nativeDolbyVision)) ?? d.nativeDolbyVision
     }
 }
 

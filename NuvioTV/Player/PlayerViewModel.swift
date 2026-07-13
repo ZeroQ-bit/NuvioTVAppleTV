@@ -121,6 +121,11 @@ final class NuvioPlayerOptions: KSOptions {
     /// can (see updateVideo) to lower the odds of a wedge.
     var matchDisplayCriteria = false
 
+    /// True for a native-DV session (playing the DV-tagged local playlist):
+    /// don't clamp DV→HDR10 in the display request — the clamp exists because
+    /// the Metal path OUTPUTS HDR10, which isn't true here.
+    var nativeDV = false
+
     /// The dynamic range last requested from the display, so repeat calls
     /// with identical criteria don't re-hit the HDMI handshake.
     private var lastAppliedDynamicRange: Int32?
@@ -155,8 +160,9 @@ final class NuvioPlayerOptions: KSOptions {
               let formatDescription
         else { return }
         var target = formatDescription.dynamicRange
-        // FFmpeg/Metal renders DV as HDR10 output (KSPlayer's own mapping).
-        if target == .dolbyVision { target = .hdr10 }
+        // FFmpeg/Metal renders DV as HDR10 output (KSPlayer's own mapping) —
+        // but a native-DV session really does emit Dolby Vision, so keep it.
+        if target == .dolbyVision, !nativeDV { target = .hdr10 }
         let available = DynamicRange.availableHDRModes   // [.sdr] when none
         if target != .sdr, !available.contains(target) {
             if available.contains(.hdr10) { target = .hdr10 }
@@ -299,12 +305,173 @@ final class PlayerViewModel: ObservableObject {
         if let vlcEngine { vlcEngine.pause() } else { playerLayer?.pause() }
     }
     private func engineSeek(to seconds: Double, autoPlay: Bool) {
+        // Native-DV session: the player's timeline is the local playlist,
+        // which starts at dvTimeOffset and only extends as far as the remux
+        // has written. In-window seeks translate; out-of-window seeks restart
+        // the remux at the target (the source supports range requests).
+        if usingNativeDV {
+            let windowEnd = dvRemuxFinished ? .infinity : dvTimeOffset + dvWrittenSeconds
+            if seconds < dvTimeOffset - 2 || seconds > windowEnd + 4 {
+                restartNativeDV(at: seconds)
+                return
+            }
+            playerLayer?.seek(time: max(seconds - dvTimeOffset, 0), autoPlay: autoPlay) { _ in }
+            return
+        }
         if let vlcEngine {
             vlcEngine.seek(to: seconds)
             if autoPlay { vlcEngine.play() }
         } else {
             playerLayer?.seek(time: seconds, autoPlay: autoPlay) { _ in }
         }
+    }
+
+    // MARK: - Native Dolby Vision (experimental)
+
+    /// True while playback runs off the DV-tagged local playlist (real DV out
+    /// through Apple's pipeline). See DVRemuxer for the machinery.
+    @Published private(set) var usingNativeDV = false
+    private var dvRemuxer: DVRemuxer?
+    /// Absolute source time (seconds) that the local playlist's t=0 maps to.
+    private var dvTimeOffset: Double = 0
+    /// Seconds of content written past dvTimeOffset (the seekable window).
+    private var dvWrittenSeconds: Double = 0
+    private var dvRemuxFinished = false
+    /// Full duration from the FFmpeg session — the growing playlist's own
+    /// duration would otherwise creep up the timeline as segments land.
+    private var dvFullDuration: Double = 0
+    /// One attempt per stream URL; a failed/abandoned URL never re-enters.
+    private var dvFailedURLs: Set<String> = []
+    private var dvAttempted = false
+    private var dvRestarting = false
+    /// Old remuxers kept alive until teardown so their segment dirs survive
+    /// while AVPlayer may still be reading from them mid-restart.
+    private var dvRetiredRemuxers: [DVRemuxer] = []
+
+    /// Called from readyToPlay on the FFmpeg engine. Starts a background
+    /// remux when every gate passes; playback continues undisturbed until the
+    /// playlist is ready, then switches in place.
+    private func maybeStartNativeDV() {
+        guard settings.nativeDolbyVision,
+              !usingNativeDV, !dvAttempted, dvRemuxer == nil, !isExiting,
+              effectiveEngine == .auto,
+              let player = playerLayer?.player, player is KSMEPlayer,
+              let urlString = currentEntry.stream.url,
+              !dvFailedURLs.contains(urlString),
+              currentURL?.isFileURL != true,
+              DynamicRange.availableHDRModes.contains(.dolbyVision)
+        else { return }
+        let track = player.tracks(mediaType: .video).first(where: \.isEnabled)
+            ?? player.tracks(mediaType: .video).first
+        guard let profile = track?.dovi?.dv_profile, profile == 5 || profile == 8 else { return }
+
+        dvAttempted = true
+        NSLog("[NuvioDV] DV profile %d detected — starting background remux", Int(profile))
+        startDVRemux(from: max(position - 2, 0), isRestart: false)
+    }
+
+    private func startDVRemux(from startAt: Double, isRestart: Bool) {
+        guard let urlString = currentEntry.stream.url else { return }
+        if let old = dvRemuxer {
+            old.cancel()
+            dvRetiredRemuxers.append(old)
+        }
+        let remuxer = DVRemuxer(
+            input: urlString, startAt: startAt,
+            preferredAudioLanguage: settings.preferredAudioLanguage
+        )
+        dvRemuxer = remuxer
+        remuxer.onIneligible = { [weak self] reason in
+            guard let self, self.dvRemuxer === remuxer else { return }
+            NSLog("[NuvioDV] ineligible: %@", reason)
+            self.dvFailedURLs.insert(urlString)
+            self.dvRemuxer = nil
+            if self.usingNativeDV { self.abandonNativeDV() }
+        }
+        remuxer.onError = { [weak self] message in
+            guard let self, self.dvRemuxer === remuxer else { return }
+            NSLog("[NuvioDV] remux error: %@", message)
+            self.dvFailedURLs.insert(urlString)
+            self.dvRemuxer = nil
+            if self.usingNativeDV { self.abandonNativeDV() }
+        }
+        remuxer.onProgress = { [weak self] written in
+            guard let self, self.dvRemuxer === remuxer else { return }
+            self.dvWrittenSeconds = max(self.dvWrittenSeconds, written)
+        }
+        remuxer.onFinished = { [weak self] in
+            guard let self, self.dvRemuxer === remuxer else { return }
+            self.dvRemuxFinished = true
+        }
+        remuxer.onReady = { [weak self] playlist, actualStart in
+            guard let self, self.dvRemuxer === remuxer, !self.isExiting else { return }
+            self.dvTimeOffset = actualStart
+            self.dvRestarting = false
+            if isRestart {
+                self.load(entry: self.currentEntry, overrideURL: playlist)
+            } else {
+                self.switchToNativeDV(playlist: playlist)
+            }
+        }
+        remuxer.start()
+    }
+
+    /// The playlist is playable — swap engines in place, keeping position.
+    private func switchToNativeDV(playlist: URL) {
+        guard !usingNativeDV, !isExiting else { return }
+        dvFullDuration = duration
+        dvRemuxFinished = dvRemuxFinished || false
+        usingNativeDV = true
+        pendingResume = nil
+        showToast("Dolby Vision — native output")
+        NSLog("[NuvioDV] switching to native playlist (offset %.1fs)", dvTimeOffset)
+        load(entry: currentEntry, overrideURL: playlist)
+    }
+
+    /// A seek landed outside the remuxed window — re-remux from the target.
+    private func restartNativeDV(at target: Double) {
+        guard usingNativeDV, !dvRestarting else { return }
+        dvRestarting = true
+        isBuffering = true
+        let clamped = max(min(target, duration > 0 ? duration - 5 : target), 0)
+        position = clamped
+        clock.position = clamped
+        dvWrittenSeconds = 0
+        dvRemuxFinished = false
+        NSLog("[NuvioDV] out-of-window seek → re-remux from %.1fs", clamped)
+        startDVRemux(from: max(clamped - 2, 0), isRestart: true)
+    }
+
+    /// Any DV failure: return to the FFmpeg engine at the same position —
+    /// i.e. exactly the pre-DV behavior (decoded HDR10).
+    private func abandonNativeDV() {
+        guard usingNativeDV else { resetNativeDV(); return }
+        NSLog("[NuvioDV] abandoning native DV — falling back to FFmpeg engine")
+        if let urlString = currentEntry.stream.url { dvFailedURLs.insert(urlString) }
+        showToast("Native Dolby Vision failed — using HDR10")
+        pendingResume = position > 10 ? position : nil
+        load(entry: currentEntry)   // overrideURL nil → resetNativeDV() runs
+    }
+
+    /// Tear down DV state (normal loads, teardown). Keeps dvFailedURLs.
+    private func resetNativeDV() {
+        dvRemuxer?.cancel()
+        if let remuxer = dvRemuxer { dvRetiredRemuxers.append(remuxer) }
+        dvRemuxer = nil
+        usingNativeDV = false
+        dvAttempted = false
+        dvRestarting = false
+        dvTimeOffset = 0
+        dvWrittenSeconds = 0
+        dvRemuxFinished = false
+        dvFullDuration = 0
+    }
+
+    /// Delete every remux directory. Only safe once playback is done.
+    private func purgeDVDirectories() {
+        for remuxer in dvRetiredRemuxers { remuxer.cleanup() }
+        dvRetiredRemuxers = []
+        dvRemuxer?.cleanup()
     }
 
     // Post-play / auto-next
@@ -562,8 +729,13 @@ final class PlayerViewModel: ObservableObject {
 
     // MARK: - Loading
 
-    private func load(entry: StreamEntry) {
-        guard let urlString = entry.stream.url, let url = URL(string: urlString) else {
+    /// `overrideURL` is the native-DV path: play this local playlist instead
+    /// of the entry's stream URL (entry stays the logical source for progress,
+    /// source panels, failover identity). A normal load (nil) always resets
+    /// any DV session first.
+    private func load(entry: StreamEntry, overrideURL: URL? = nil) {
+        if overrideURL == nil { resetNativeDV() }
+        guard let url = overrideURL ?? entry.stream.url.flatMap(URL.init(string:)) else {
             overlay = .error("This source has no playable link.")
             return
         }
@@ -580,7 +752,8 @@ final class PlayerViewModel: ObservableObject {
         pausedAt = nil
 
         // VLC engine path: self-contained, skips all the KSPlayer/FFmpeg setup.
-        if effectiveEngine == .vlc {
+        // (Never for the DV playlist — that must ride the native pipeline.)
+        if effectiveEngine == .vlc, overrideURL == nil {
             loadViaVLC(url: url)
             return
         }
@@ -596,6 +769,10 @@ final class PlayerViewModel: ObservableObject {
         // always the right policy for 24fps content.
         options.matchDisplayCriteria = settings.matchContentDisplayMode
         options.pulldown60Hz = true
+        // Native-DV session: if the user also enabled display matching, let
+        // updateVideo request the real Dolby Vision mode instead of clamping
+        // DV→HDR10 (the clamp exists for the decoded-HDR10 Metal path).
+        options.nativeDV = overrideURL != nil
 
         // Route containers AVPlayer can't handle (the typical debrid remux is
         // an MKV) STRAIGHT to the FFmpeg engine. Otherwise KSPlayer tries the
@@ -629,11 +806,16 @@ final class PlayerViewModel: ObservableObject {
         // exactly like a single-engine player (mpv). The OTHER engine remains
         // second for genuine failover.
         let needsFFmpeg: Bool
-        switch effectiveEngine {
-        case .native: needsFFmpeg = false
-        case .ffmpeg: needsFFmpeg = true
-        // .vlc returns before reaching here; route by container as a fallback.
-        case .auto, .vlc: needsFFmpeg = !nativeContainers.contains(ext)
+        if overrideURL != nil {
+            // DV playlist: Apple's pipeline only — that's the whole point.
+            needsFFmpeg = false
+        } else {
+            switch effectiveEngine {
+            case .native: needsFFmpeg = false
+            case .ffmpeg: needsFFmpeg = true
+            // .vlc returns before reaching here; route by container as a fallback.
+            case .auto, .vlc: needsFFmpeg = !nativeContainers.contains(ext)
+            }
         }
         KSOptions.firstPlayerType = needsFFmpeg ? KSMEPlayer.self : KSAVPlayer.self
         KSOptions.secondPlayerType = needsFFmpeg ? KSAVPlayer.self : KSMEPlayer.self
@@ -1810,6 +1992,12 @@ final class PlayerViewModel: ObservableObject {
                   // Only if we're still on the same load that armed this.
                   self.currentURL == targetURL
             else { return }
+            // A stuck DV playlist load falls back to the FFmpeg engine, not
+            // to a different source — the source itself is fine.
+            if self.usingNativeDV {
+                self.abandonNativeDV()
+                return
+            }
             self.showToast("Source didn't load — trying another")
             self.attemptFailover(
                 afterError: NSError(
@@ -1843,6 +2031,12 @@ final class PlayerViewModel: ObservableObject {
     /// same quality to the front (used by the load-timeout failover, so a slow
     /// 4K link is replaced by another 4K link, not a random 480p one).
     private func attemptFailover(afterError error: Error, preferResolution: String? = nil) {
+        // Native-DV playback died → the remux/playlist is the suspect, not
+        // the source. Fall back to the FFmpeg engine on the same source.
+        if usingNativeDV {
+            abandonNativeDV()
+            return
+        }
         guard !isFailingOver else { return }
         isFailingOver = true
         failedSourceIDs.insert(currentEntry.id)
@@ -2228,6 +2422,7 @@ final class PlayerViewModel: ObservableObject {
         cacheTask?.cancel()
         thumbnailTask?.cancel()
         countdownTask?.cancel()
+        dvRemuxer?.cancel()   // stop the DV remux's network reads immediately
         enginePause()
         // Drop any overlay so the wait shows the bare (paused) video, not a
         // half-dead confirm dialog.
@@ -2250,6 +2445,8 @@ final class PlayerViewModel: ObservableObject {
         playerLayer = nil
         vlcEngine?.stop()
         vlcEngine = nil
+        resetNativeDV()
+        purgeDVDirectories()
     }
 
     /// The next-episode line shown on the Up Next / Still Watching cards.
@@ -2272,7 +2469,8 @@ final class PlayerViewModel: ObservableObject {
     }
 
     var viaLine: String? {
-        "via \(currentEntry.addonName) · \(currentEntry.stream.displayName) · \(engineName) engine"
+        let engine = usingNativeDV ? "Dolby Vision (native)" : "\(engineName) engine"
+        return "via \(currentEntry.addonName) · \(currentEntry.stream.displayName) · \(engine)"
     }
 
     var isShowingError: Bool {
@@ -2520,8 +2718,10 @@ final class PlayerViewModel: ObservableObject {
             if track.bitDepth > 0 {
                 video.append(.init(label: "Bit Depth", value: "\(track.bitDepth)-bit"))
             }
-            if track.dovi != nil {
-                video.append(.init(label: "HDR", value: "Dolby Vision"))
+            if usingNativeDV {
+                video.append(.init(label: "HDR", value: "Dolby Vision (native output)"))
+            } else if track.dovi != nil {
+                video.append(.init(label: "HDR", value: "Dolby Vision → HDR10"))
             } else if let range = track.formatDescription?.dynamicRange, range != .sdr {
                 // HDR10 / HLG — anything beyond SDR is worth surfacing.
                 video.append(.init(label: "HDR", value: range.description))
@@ -2631,13 +2831,18 @@ extension PlayerViewModel: KSPlayerLayerDelegate {
             }
             isBuffering = false
             duration = layer.player.duration
+            // DV playlist grows as the remux writes — pin the timeline to the
+            // real duration learned from the FFmpeg session, and keep that
+            // session's chapters (the playlist has none).
+            if usingNativeDV, dvFullDuration > 0 { duration = dvFullDuration }
             clock.duration = duration
             // Engine always letterboxes (aspect-fit); zoom/stretch happen as a
             // SwiftUI transform driven by the natural size published here.
             layer.player.contentMode = .scaleAspectFit
             videoNaturalSize = layer.player.naturalSize
-            chapters = layer.player.chapters
+            if !usingNativeDV { chapters = layer.player.chapters }
             applyNativeDisplayCriteria()
+            maybeStartNativeDV()
             if playbackSpeed != 1 {
                 layer.player.playbackRate = playbackSpeed
             }
@@ -2710,6 +2915,10 @@ extension PlayerViewModel: KSPlayerLayerDelegate {
     }
 
     func player(layer: KSPlayerLayer, currentTime: TimeInterval, totalTime: TimeInterval) {
+        // Native-DV: the playlist timeline starts at dvTimeOffset — map every
+        // engine-relative time back to the absolute source timeline so
+        // position/progress/subtitles/auto-next all keep working unchanged.
+        let currentTime = usingNativeDV ? currentTime + dvTimeOffset : currentTime
         // Catch-all: the clock is advancing, so playback has definitely begun —
         // clear the loading backdrop even if no ready/buffer-finished state
         // fired. Skipped while the initial pre-cache is holding playback.
@@ -2718,8 +2927,8 @@ extension PlayerViewModel: KSPlayerLayerDelegate {
             loadPhase = nil
         }
         if currentTime.isFinite { position = currentTime }
-        if totalTime.isFinite, totalTime > 0 { duration = totalTime }
-        buffered = layer.player.playableTime
+        if totalTime.isFinite, totalTime > 0, !usingNativeDV { duration = totalTime }
+        buffered = layer.player.playableTime + (usingNativeDV ? dvTimeOffset : 0)
         // Publish to the clock only on meaningful change (~2Hz) so the few
         // time-displaying views re-render gently instead of every frame.
         if abs(clock.position - position) >= 0.4 { clock.position = position }
