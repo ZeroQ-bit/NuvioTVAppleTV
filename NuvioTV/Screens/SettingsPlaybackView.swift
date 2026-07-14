@@ -74,6 +74,23 @@ struct PlaybackSettingsDetail: View {
                     options: PlayerEngine.allCases.map { NuvioDropdownOption($0.rawValue, $0.label) }
                 ) { store.settings.playerEngine = PlayerEngine(rawValue: $0) ?? .auto }
 
+                // External engine: pick WHICH installed app receives streams.
+                // canOpenURL only sees apps actually on this Apple TV, so the
+                // list is exactly what's installed — and when nothing is, the
+                // section stays blank.
+                if store.settings.playerEngine == .external {
+                    let installed = ExternalPlayers.installed
+                    if !installed.isEmpty {
+                        NuvioDropdown(
+                            title: "External player",
+                            subtitle: "Streams open in this app; playback, resume and history then live there",
+                            icon: "arrow.up.forward.app.fill",
+                            selection: store.settings.externalPlayerID,
+                            options: installed.map { NuvioDropdownOption($0.id, $0.name) }
+                        ) { store.settings.externalPlayerID = $0 }
+                    }
+                }
+
                 PlaybackToggleRow(
                     icon: "sparkles.tv.fill",
                     title: "Native Dolby Vision",

@@ -39,6 +39,9 @@ targets:
         LSApplicationQueriesSchemes:
           - infuse
           - infuse-x-callback
+          - vlc-x-callback
+          - nplayer-http
+          - open-vidhub
         NSAppTransportSecurity:
           NSAllowsArbitraryLoads: true
     settings:

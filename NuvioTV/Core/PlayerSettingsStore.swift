@@ -13,7 +13,7 @@ enum NextEpisodeThresholdMode: String, Codable, CaseIterable {
 ///   other engine remains the automatic fallback either way.
 /// - native / ffmpeg: force that engine first for every stream.
 enum PlayerEngine: String, Codable, CaseIterable {
-    case auto, native, ffmpeg, vlc
+    case auto, native, ffmpeg, vlc, external
 
     var label: String {
         switch self {
@@ -21,6 +21,7 @@ enum PlayerEngine: String, Codable, CaseIterable {
         case .native: return "Native (AVPlayer)"
         case .ffmpeg: return "FFmpeg (KSPlayer)"
         case .vlc: return "VLC"
+        case .external: return "External app"
         }
     }
 
@@ -28,6 +29,8 @@ enum PlayerEngine: String, Codable, CaseIterable {
         switch self {
         case .vlc:
             return "VLC buffers internally (no cache bar) and renders its own subtitles. Try it when a file is choppy on the other engines."
+        case .external:
+            return "Send every stream to another player app installed on this Apple TV (Infuse, VLC, …) instead of playing in Nuvio. Pick the app below."
         default:
             return "Auto picks the hardware AVPlayer for MP4/HLS and FFmpeg for MKV & friends; the other engine stays as automatic fallback."
         }
@@ -99,6 +102,9 @@ struct PlayerSettings: Codable, Equatable {
     var preferredAudioLanguage: String = ""
     /// Playback engine selection (see PlayerEngine).
     var playerEngine: PlayerEngine = .auto
+    /// Which external player app receives streams when playerEngine is
+    /// .external (id from ExternalPlayers.catalog).
+    var externalPlayerID: String = "infuse"
     /// LEGACY (pre-audioOutputMode): the old force-renderer toggle. Kept only
     /// so existing saves migrate — read once in the decoder, never in the UI.
     var audioRendererEnabled: Bool = false
@@ -194,6 +200,7 @@ struct PlayerSettings: Codable, Equatable {
         preferredSubtitleLanguage = (try? c.decode(String.self, forKey: .preferredSubtitleLanguage)) ?? d.preferredSubtitleLanguage
         preferredAudioLanguage = (try? c.decode(String.self, forKey: .preferredAudioLanguage)) ?? d.preferredAudioLanguage
         playerEngine = (try? c.decode(PlayerEngine.self, forKey: .playerEngine)) ?? d.playerEngine
+        externalPlayerID = (try? c.decode(String.self, forKey: .externalPlayerID)) ?? d.externalPlayerID
         audioRendererEnabled = (try? c.decode(Bool.self, forKey: .audioRendererEnabled)) ?? d.audioRendererEnabled
         // Migration: saves from before audioOutputMode existed carry only the
         // old force-renderer bool — honor it as an explicit "renderer".

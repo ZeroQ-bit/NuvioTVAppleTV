@@ -331,7 +331,9 @@ struct EnginePanelContent: View {
 
     var body: some View {
         VStack(spacing: NuvioSpacing.sm) {
-            ForEach(PlayerEngine.allCases, id: \.self) { engine in
+            // .external is a pre-playback handoff, not an in-player engine —
+            // it can't take over a session that's already playing here.
+            ForEach(PlayerEngine.allCases.filter { $0 != .external }, id: \.self) { engine in
                 Button {
                     viewModel.switchEngine(engine)
                 } label: {

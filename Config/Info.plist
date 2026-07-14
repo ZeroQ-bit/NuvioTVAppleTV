@@ -24,6 +24,9 @@
 	<array>
 		<string>infuse</string>
 		<string>infuse-x-callback</string>
+		<string>vlc-x-callback</string>
+		<string>nplayer-http</string>
+		<string>open-vidhub</string>
 	</array>
 	<key>NSAppTransportSecurity</key>
 	<dict>

@@ -465,24 +465,24 @@ struct RootView: View {
         case .streams(let meta, let video):
             StreamsView(meta: meta, video: video) { entry, all in
                 let key = ProgressStore.key(metaID: meta.id, video: video)
-                playback = PlaybackRequest(
+                startPlayback(PlaybackRequest(
                     meta: meta,
                     video: video,
                     entry: entry,
                     allEntries: all,
                     resumePosition: progressStore.progress(for: key)?.positionSeconds
-                )
+                ))
             }
         case .streamsFromStart(let meta, let video):
             // Same picker, but playback ignores any saved progress (Start Over).
             StreamsView(meta: meta, video: video) { entry, all in
-                playback = PlaybackRequest(
+                startPlayback(PlaybackRequest(
                     meta: meta,
                     video: video,
                     entry: entry,
                     allEntries: all,
                     resumePosition: nil
-                )
+                ))
             }
         }
     }
@@ -530,6 +530,23 @@ struct RootView: View {
     /// Resume from Continue Watching. Items saved on this device carry the
     /// stream URL and replay directly; items pulled from the account have no
     /// URL (the backend doesn't store it), so we route to source selection.
+    /// Single entry point for starting playback. External-app engine hands
+    /// the stream straight to the chosen player (Infuse etc.) instead of
+    /// opening Nuvio's own player; if the chosen app was uninstalled, any
+    /// other installed one is used; none installed → play internally.
+    private func startPlayback(_ request: PlaybackRequest) {
+        if playerSettings.settings.playerEngine == .external,
+           let urlString = request.entry.stream.url {
+            let chosen = ExternalPlayers.player(id: playerSettings.settings.externalPlayerID)
+            let target = (chosen?.isInstalled == true ? chosen : nil) ?? ExternalPlayers.installed.first
+            if let target {
+                target.open(streamURL: urlString)
+                return
+            }
+        }
+        playback = request
+    }
+
     private func resume(_ progress: WatchProgress, fromBeginning: Bool = false) {
         Task { await resumeResolved(progress, fromBeginning: fromBeginning) }
     }
@@ -631,12 +648,12 @@ struct RootView: View {
             infoHash: nil,
             behaviorHints: nil
         )
-        playback = PlaybackRequest(
+        startPlayback(PlaybackRequest(
             meta: meta,
             video: video,
             entry: StreamEntry(addonName: "Continue Watching", stream: stream),
             allEntries: [],
             resumePosition: fromBeginning ? 0 : progress.positionSeconds
-        )
+        ))
     }
 }
